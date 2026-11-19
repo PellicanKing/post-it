@@ -128,6 +128,47 @@ def combo_label(combo):
     return "+".join(parts + [vk_name(vk)])
 
 
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+RUN_NAME = "PostIt"
+
+
+def autostart_command():
+    """Comando che Windows esegue all'accesso (exe oppure pythonw + script)."""
+    if getattr(sys, "frozen", False):
+        return '"%s"' % sys.executable
+    exe = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+    if not os.path.exists(exe):
+        exe = sys.executable
+    return '"%s" "%s"' % (exe, os.path.abspath(__file__))
+
+
+def autostart_enabled():
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
+            winreg.QueryValueEx(k, RUN_NAME)
+        return True
+    except OSError:
+        return False
+
+
+def set_autostart(on):
+    """Aggiunge o toglie il Post-it dai programmi che partono all'accesso a Windows."""
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:
+            if on:
+                winreg.SetValueEx(k, RUN_NAME, 0, winreg.REG_SZ, autostart_command())
+            else:
+                try:
+                    winreg.DeleteValue(k, RUN_NAME)
+                except FileNotFoundError:
+                    pass
+        return True
+    except OSError:
+        return False
+
+
 def documents_dir():
     buf = ctypes.create_unicode_buffer(260)
     if ctypes.windll.shell32.SHGetFolderPathW(None, 5, None, 0, buf) == 0 and buf.value:
@@ -452,6 +493,15 @@ class SettingsPanel(Popup):
                    font=app.f_small, fg=c["soft"], justify="left").pack(anchor="w")
         self.switch(row, app.data["large_mode"], self.toggle_large).pack(side="right")
 
+        row = tk.Frame(self.card, bg=c["bg"])
+        row.pack(fill="x", pady=(px(8), 0))
+        text = tk.Frame(row, bg=c["bg"])
+        text.pack(side="left", fill="x", expand=True)
+        self.label(text, "Avvia con Windows", font=app.f_small_b).pack(anchor="w")
+        self.label(text, "Si apre da solo quando accendi il PC,\ncosì le scorciatoie funzionano subito",
+                   font=app.f_small, fg=c["soft"], justify="left").pack(anchor="w")
+        self.switch(row, autostart_enabled(), self.toggle_autostart).pack(side="right")
+
         self.separator()
         self.label(self.card, "Sul post-it:  1·2·3 cambia colore  ·  Invio scrivi  ·  Esc esci\n"
                               "Note:  # titolo  ·  - elenco  ·  1. numerato  ·  *grassetto* (Ctrl+B)"
@@ -486,6 +536,15 @@ class SettingsPanel(Popup):
         if not app.data["large_mode"] and app.mode == "large":
             app.set_mode("normal")
         app.schedule_save()
+        self.build()
+
+    def toggle_autostart(self):
+        on = not autostart_enabled()
+        if set_autostart(on):
+            self.msg, self.msg_warn = ("Partirà all'accensione del PC" if on
+                                       else "Non partirà più da solo"), False
+        else:
+            self.msg, self.msg_warn = "Impossibile cambiare l'avvio automatico", True
         self.build()
 
     def reset(self):
@@ -1851,6 +1910,8 @@ def main():
         pass
     if signal_existing_instance():
         return  # già aperto: l'istanza esistente si mostra
+    if autostart_enabled():
+        set_autostart(True)  # aggiorna il percorso se il programma è stato spostato
     PostItApp().run()
 
 

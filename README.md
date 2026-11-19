@@ -12,7 +12,7 @@ Tre foglietti per Windows 10/11 che restano sopra le altre finestre: uno per le 
 
 Al primo avvio Windows può mostrare «Windows ha protetto il PC»: clicca **Ulteriori informazioni** → **Esegui comunque**. Succede con i programmi non firmati scaricati da internet; il codice completo è qui sotto.
 
-Per averlo all'accensione: premi `Win`+`R`, scrivi `shell:startup` e mettici un collegamento a PostIt.exe.
+Per averlo a ogni accensione del PC: apri il riquadro delle scorciatoie (simbolo della tastiera in basso a destra) e attiva **Avvia con Windows**. Così le scorciatoie funzionano subito, senza aprirlo a mano.
 
 ## I tre post-it
 
