@@ -13,8 +13,10 @@ personalizzabili dal simbolo ⌨ in basso a destra):
   Ctrl+Alt+H      nascondi / mostra
   Ctrl+Alt+G      riduci a barra / espandi (+ versione grande, se attivata)
   Ctrl+Alt+1/2/3  apri il post-it giallo / verde / azzurro
+                  (premuta di nuovo: l'altro post-it dello stesso colore)
 Sul post-it:
-  1 / 2 / 3       cambia post-it (quando non stai scrivendo)
+  1 / 2 / 3       cambia post-it (quando non stai scrivendo); di nuovo lo stesso
+                  numero o clic sul colore già aperto = l'altro dei due
   Invio o lettere inizia a scrivere      Esc  smetti di scrivere
 Nelle note:
   # / ## / ### + spazio   titolo grande / medio / piccolo
@@ -54,6 +56,18 @@ NOTES = {
                  ink="#0b3550", soft="#6a9ab4", todo=False, notes=True),
 }
 ORDER = ["yellow", "green", "blue"]
+
+
+def note_id(color, page):
+    """Ogni colore ha due post-it: "yellow" (1°) e "yellow2" (2°)."""
+    return color + "2" if page else color
+
+
+def note_color(nid):
+    return nid[:-1] if nid.endswith("2") else nid
+
+
+NOTE_IDS = [note_id(c, p) for c in ORDER for p in (0, 1)]
 FAINT = "#a9a9a9"
 WARN = "#c62828"
 
@@ -64,9 +78,9 @@ ACTIONS = [  # (azione, descrizione, combinazione predefinita)
     ("pin", "Fisso sopra tutto / non fisso", (CA, ord("P"))),
     ("hide", "Nascondi / mostra", (CA, ord("H"))),
     ("expand", "Riduci / espandi", (CA, ord("G"))),
-    ("note:yellow", "Apri post-it giallo", (CA, ord("1"))),
-    ("note:green", "Apri post-it verde", (CA, ord("2"))),
-    ("note:blue", "Apri post-it azzurro", (CA, ord("3"))),
+    ("note:yellow", "Apri giallo (di nuovo: l'altro giallo)", (CA, ord("1"))),
+    ("note:green", "Apri verde (di nuovo: l'altro verde)", (CA, ord("2"))),
+    ("note:blue", "Apri azzurro (di nuovo: l'altro azzurro)", (CA, ord("3"))),
 ]
 ACTION_TEXT = {a: t for a, t, _ in ACTIONS}
 DEFAULT_KEYS = {a: list(k) for a, _, k in ACTIONS}
@@ -101,6 +115,35 @@ for fn, args, res in [
     (kernel32.WaitForSingleObject, [HANDLE, DWORD], DWORD),
 ]:
     fn.argtypes, fn.restype = args, res
+
+
+class MONITORINFO(ctypes.Structure):
+    _fields_ = [("cbSize", DWORD), ("rcMonitor", wintypes.RECT),
+                ("rcWork", wintypes.RECT), ("dwFlags", DWORD)]
+
+
+user32.MonitorFromPoint.argtypes, user32.MonitorFromPoint.restype = [wintypes.POINT, DWORD], HANDLE
+user32.GetMonitorInfoW.argtypes = [HANDLE, ctypes.POINTER(MONITORINFO)]
+user32.GetMonitorInfoW.restype = wintypes.BOOL
+
+
+def work_area(x, y):
+    """(sinistra, alto, destra, basso) dello schermo più vicino al punto,
+    senza la barra delle applicazioni."""
+    mi = MONITORINFO()
+    mi.cbSize = ctypes.sizeof(mi)
+    mon = user32.MonitorFromPoint(wintypes.POINT(int(x), int(y)), 2)  # il più vicino
+    if mon and user32.GetMonitorInfoW(mon, ctypes.byref(mi)):
+        r = mi.rcWork
+        return r.left, r.top, r.right, r.bottom
+    return 0, 0, user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
+
+
+def fit_rect(x, y, w, h, point=None):
+    """Sposta (e se serve rimpicciolisce) il riquadro perché resti tutto sullo schermo."""
+    left, top, right, bottom = work_area(*(point or (x + w // 2, y + min(h, 30) // 2)))
+    w, h = min(w, right - left), min(h, bottom - top)
+    return max(left, min(x, right - w)), max(top, min(y, bottom - h)), w, h
 
 
 def vk_name(vk):
@@ -178,9 +221,10 @@ def documents_dir():
 
 # ---------------------------------------------------------------- dati
 def default_data():
-    return {"current": "yellow", "topmost": True, "geometry": None, "large_mode": False,
+    return {"current": "yellow", "page": {k: 0 for k in ORDER},
+            "topmost": True, "geometry": None, "large_mode": False,
             "hotkeys": {a: list(k) for a, k in DEFAULT_KEYS.items()},
-            "notes": {k: {"text": "", "todos": []} for k in ORDER}}
+            "notes": {k: {"text": "", "todos": []} for k in NOTE_IDS}}
 
 
 def load_data():
@@ -196,7 +240,10 @@ def load_data():
     for action, combo in (saved.get("hotkeys") or {}).items():
         if action in DEFAULT_KEYS and isinstance(combo, list) and len(combo) == 2:
             data["hotkeys"][action] = [int(combo[0]), int(combo[1])]
-    for k in ORDER:
+    for color, page in (saved.get("page") or {}).items():
+        if color in NOTES and page in (0, 1):
+            data["page"][color] = page
+    for k in NOTE_IDS:
         note = (saved.get("notes") or {}).get(k) or {}
         data["notes"][k]["text"] = str(note.get("text", ""))
         todos = []
@@ -304,11 +351,13 @@ class Tooltip:
         tk.Label(self.tip, text=self.text, bg="#333333", fg="white", padx=6, pady=2,
                  font=("Segoe UI", 9)).pack()
         self.tip.update_idletasks()
-        x = self.widget.winfo_rootx() + self.widget.winfo_width() - self.tip.winfo_reqwidth()
-        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
-        if y + self.tip.winfo_reqheight() > self.widget.winfo_screenheight():
-            y = self.widget.winfo_rooty() - self.tip.winfo_reqheight() - 4
-        self.tip.geometry("+%d+%d" % (max(0, x), y))
+        w, h = self.tip.winfo_reqwidth(), self.tip.winfo_reqheight()
+        wx, wy = self.widget.winfo_rootx(), self.widget.winfo_rooty()
+        x, y = wx + self.widget.winfo_width() - w, wy + self.widget.winfo_height() + 4
+        if y + h > work_area(wx, wy)[3]:
+            y = wy - h - 4
+        x, y, _w, _h = fit_rect(x, y, w, h, (wx, wy))
+        self.tip.geometry("+%d+%d" % (x, y))
 
     def hide(self, _e=None):
         if self.tip:
@@ -370,16 +419,14 @@ class Popup:
     def position(self):
         self.win.update_idletasks()
         w, h = self.win.winfo_reqwidth(), self.win.winfo_reqheight()
-        sw, sh = self.win.winfo_screenwidth(), self.win.winfo_screenheight()
+        right, top, bottom = self.anchor
         if self.br is None:
-            right, top, bottom = self.anchor
             x, y = right - w, top - h - 6
-            if y < 0:
+            if y < work_area(right, top)[1]:
                 y = bottom + 6
         else:
             x, y = self.br[0] - w, self.br[1] - h
-        x = max(4, min(x, sw - w - 4))
-        y = max(4, min(y, sh - h - 4))
+        x, y, w, h = fit_rect(x, y, w, h, (right, top))
         self.br = (x + w, y + h)
         self.win.geometry("+%d+%d" % (x, y))
 
@@ -411,9 +458,9 @@ class ExportMenu(Popup):
         self.header("Esporta")
         self.label(self.card, "Salva un file di testo in Documenti\\Post-it",
                    font=app.f_small, fg=self.c["soft"]).pack(anchor="w", pady=(0, app.px(4)))
-        self.menu_item(self.card, "Questo post-it (%s)" % self.c["label"],
-                       lambda: self.done(app.export([app.data["current"]])))
-        self.menu_item(self.card, "Tutti e tre", lambda: self.done(app.export(ORDER)))
+        self.menu_item(self.card, "Questo post-it (%s)" % app.note_label(app.current_id()),
+                       lambda: self.done(app.export([app.current_id()])))
+        self.menu_item(self.card, "Tutti", lambda: self.done(app.export(app.used_ids())))
         self.show()
 
     def done(self, path):
@@ -503,7 +550,8 @@ class SettingsPanel(Popup):
         self.switch(row, autostart_enabled(), self.toggle_autostart).pack(side="right")
 
         self.separator()
-        self.label(self.card, "Sul post-it:  1·2·3 cambia colore  ·  Invio scrivi  ·  Esc esci\n"
+        self.label(self.card, "Sul post-it:  1·2·3 cambia colore (di nuovo: l'altro dello stesso"
+                              " colore)\nInvio scrivi  ·  Esc esci\n"
                               "Note:  # titolo  ·  - elenco  ·  1. numerato  ·  *grassetto* (Ctrl+B)"
                               "  ·  _corsivo_ (Ctrl+I)",
                    font=app.f_small, fg=c["soft"], justify="left").pack(anchor="w")
@@ -1146,18 +1194,26 @@ class RichNote:
                     t.tag_add(tag, "end-1c")
 
     def serialize(self):
-        t = self.t
-        out = []
-        for line in range(1, self.last_line() + 1):
-            block = self.block_of(line)
-            cs = self.content_start(line)
-            text = t.get("%d.%d" % (line, cs), "%d.end" % line)
-            chars = []
-            for k, ch in enumerate(text):
-                names = t.tag_names("%d.%d" % (line, cs + k))
-                chars.append((ch, "bold" in names, "italic" in names))
-            num = self.mark_number(line) if block == "num" else None
-            out.append(serialize_line(block, num, chars))
+        """Editor -> Markdown. Legge testo e stili con una sola chiamata (dump), così
+        il salvataggio resta istantaneo anche con note lunghe."""
+        out, chars, mark, on = [], [], "", set()
+        for kind, value, _idx in self.t.dump("1.0", "end", tag=True, text=True):
+            if kind == "tagon":
+                on.add(value)
+            elif kind == "tagoff":
+                on.discard(value)
+            elif kind == "text":
+                for ch in value:
+                    if ch == "\n":   # fine riga: il blocco è il tag sul ritorno a capo
+                        block = next((b for b in BLOCKS if b in on), None)
+                        m = re.match(r"\d+", mark)
+                        num = int(m.group()) if block == "num" and m else None
+                        out.append(serialize_line(block, num, chars))
+                        chars, mark = [], ""
+                    elif "mark" in on:
+                        mark += ch
+                    else:
+                        chars.append((ch, "bold" in on, "italic" in on))
         return "\n".join(out)
 
     def insert_text(self, char):
@@ -1252,10 +1308,18 @@ class PostItApp:
             x, y = int(x), int(y)
         except (AttributeError, ValueError):
             return default
-        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
-        w, h = max(min(w, sw), self.min_w), max(min(h, sh), self.min_h)
-        x, y = max(0, min(x, sw - self.px(80))), max(0, min(y, sh - self.px(60)))
+        x, y, w, h = fit_rect(x, y, max(w, self.min_w), max(h, self.min_h))
         return "%dx%d+%d+%d" % (w, h, x, y)
+
+    def place(self, x, y, w, h, point=None):
+        """Applica posizione e misura tenendo il post-it dentro lo schermo."""
+        x, y, w, h = fit_rect(x, y, w, h, point)
+        self.root.geometry("%dx%d+%d+%d" % (w, h, x, y))
+
+    def keep_on_screen(self):
+        self.root.update_idletasks()
+        self.place(self.root.winfo_x(), self.root.winfo_y(),
+                   self.root.winfo_width(), self.root.winfo_height())
 
     def show_in_taskbar(self):
         """Finestra senza bordi ma visibile nella barra e capace di ricevere la tastiera."""
@@ -1297,29 +1361,32 @@ class PostItApp:
         self.drag = (e.x_root - self.root.winfo_x(), e.y_root - self.root.winfo_y())
 
     def do_move(self, e):
-        if self.drag:
-            self.root.geometry("+%d+%d" % (e.x_root - self.drag[0], e.y_root - self.drag[1]))
+        if self.drag:  # lo schermo è quello sotto il mouse: si può passare all'altro monitor
+            self.place(e.x_root - self.drag[0], e.y_root - self.drag[1],
+                       self.root.winfo_width(), self.root.winfo_height(), (e.x_root, e.y_root))
 
     def start_resize(self, e, edge):
-        self.resize = (edge, e.x_root, e.y_root, self.root.winfo_x(), self.root.winfo_y(),
-                       self.root.winfo_width(), self.root.winfo_height())
+        x, y, w, h = (self.root.winfo_x(), self.root.winfo_y(),
+                      self.root.winfo_width(), self.root.winfo_height())
+        self.resize = (edge, e.x_root, e.y_root, x, y, w, h,
+                       work_area(x + w // 2, y + self.header_h // 2))
 
     def do_resize(self, e):
         if not self.resize:
             return
-        edge, x0, y0, x, y, w, h = self.resize
+        edge, x0, y0, x, y, w, h, (left, top, right, bottom) = self.resize
         dx, dy = e.x_root - x0, e.y_root - y0
         nx, ny, nw, nh = x, y, w, h
         if "e" in edge:
-            nw = max(self.min_w, w + dx)
+            nw = min(max(self.min_w, w + dx), right - x)
         if "w" in edge:
-            nw = max(self.min_w, w - dx)
+            nw = min(max(self.min_w, w - dx), x + w - left)
             nx = x + w - nw
         if self.mode != "collapsed":
             if "s" in edge:
-                nh = max(self.min_h, h + dy)
+                nh = min(max(self.min_h, h + dy), bottom - y)
             if "n" in edge:
-                nh = max(self.min_h, h - dy)
+                nh = min(max(self.min_h, h - dy), y + h - top)
                 ny = y + h - nh
         self.root.geometry("%dx%d+%d+%d" % (nw, nh, nx, ny))
 
@@ -1347,16 +1414,12 @@ class PostItApp:
         x, y = self.root.winfo_x(), self.root.winfo_y()
         w, h = self.normal_size()
         if mode == "collapsed":
-            geo = "%dx%d+%d+%d" % (w, self.header_h, x, y)
+            h = self.header_h
         elif mode == "large":
-            sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
-            w, h = min(max(w, self.px(460)), sw - 40), min(int(sh * 0.65), sh - 80)
-            x, y = max(0, min(x, sw - w - 10)), max(0, min(y, sh - h - 50))
-            geo = "%dx%d+%d+%d" % (w, h, x, y)
-        else:
-            geo = "%dx%d+%d+%d" % (w, h, x, y)
+            top, bottom = work_area(x + w // 2, y)[1::2]
+            w, h = max(w, self.px(460)), int((bottom - top) * 0.7)
         self.mode = mode
-        self.root.geometry(geo)
+        self.place(x, y, w, h)
         self.render()
 
     def toggle_collapse(self):
@@ -1381,6 +1444,7 @@ class PostItApp:
     def show_window(self):
         self.hidden = False
         self.root.deiconify()
+        self.keep_on_screen()  # es. dopo aver staccato un monitor
         self.root.after(30, lambda: self.root.attributes("-topmost", self.data["topmost"]))
 
     def hide_window(self):
@@ -1471,7 +1535,10 @@ class PostItApp:
         elif action == "expand":
             self.cycle_size()
         elif action.startswith("note:"):
-            self.switch(action[5:])
+            # già in vista sullo stesso colore: passa all'altro post-it di quel colore
+            visible = (not self.hidden and self.mode != "collapsed"
+                       and (self.data["topmost"] or self.is_foreground()))
+            self.switch(action[5:], toggle=visible)
             self.activate()
 
     def on_hotkey_status(self, failed):
@@ -1509,7 +1576,9 @@ class PostItApp:
             self.title_lbl.configure(text=self.warning, fg=WARN)
         else:
             hint = "   1·2·3  o scrivi" if self.is_command_mode() else ""
-            self.title_lbl.configure(text=self.c["name"] + hint, fg=self.c["ink"])
+            page = self.data["page"][self.data["current"]] + 1
+            self.title_lbl.configure(text="%s · %d%s" % (self.c["name"], page, hint),
+                                     fg=self.c["ink"])
 
     def on_key(self, e):
         editing = isinstance(e.widget, (tk.Text, tk.Entry))
@@ -1552,8 +1621,24 @@ class PostItApp:
                 self.entry.insert("end", char)
 
     # ------------------------------------------------------------ dati
+    def current_id(self):
+        color = self.data["current"]
+        return note_id(color, self.data["page"][color])
+
     def note(self):
-        return self.data["notes"][self.data["current"]]
+        return self.data["notes"][self.current_id()]
+
+    @staticmethod
+    def note_label(nid):
+        color = note_color(nid)
+        return "%s %d" % (NOTES[color]["label"], 2 if nid != color else 1)
+
+    def used_ids(self):
+        """Per «Esporta tutti»: i primi post-it sempre, i secondi solo se usati."""
+        self.sync_notes()
+        notes = self.data["notes"]
+        return [k for k in NOTE_IDS
+                if k in ORDER or notes[k]["text"].strip() or notes[k]["todos"]]
 
     def schedule_save(self):
         if self.save_job:
@@ -1578,22 +1663,27 @@ class PostItApp:
         except OSError:
             self.flash("⚠ impossibile salvare")
 
-    def switch(self, key):
-        if key != self.data["current"]:
-            self.data["current"] = key
-            self.schedule_save()
-            self.close_popup()
-            self.render()
-            self.root.focus_set()
-            self.update_hint()
+    def switch(self, color, toggle=True):
+        """Altro colore: apre il suo ultimo post-it. Stesso colore: passa all'altro dei due."""
+        if color == self.data["current"]:
+            if not toggle:
+                return
+            self.data["page"][color] ^= 1
+        else:
+            self.data["current"] = color
+        self.schedule_save()
+        self.close_popup()
+        self.render()
+        self.root.focus_set()
+        self.update_hint()
 
     def export(self, keys):
         """Scrive i post-it scelti in un file di testo; restituisce il percorso o None."""
         self.sync_notes()
         lines = ["Post-it — esportato il " + time.strftime("%d/%m/%Y %H:%M"), ""]
         for k in keys:
-            n, d = NOTES[k], self.data["notes"][k]
-            lines.append("■ %s · %s" % (n["label"], n["name"]))
+            n, d = NOTES[note_color(k)], self.data["notes"][k]
+            lines.append("■ %s · %s" % (self.note_label(k), n["name"]))
             if n["notes"]:
                 lines.append(markdown_to_plain(d["text"]).strip() or "(nessuna nota)")
                 if n["todo"]:
@@ -1608,7 +1698,7 @@ class PostItApp:
                 if not d["todos"]:
                     lines.append("(nessuna attività)")
             lines.append("")
-        which = "tutti" if len(keys) > 1 else NOTES[keys[0]]["label"]
+        which = "tutti" if len(keys) > 1 else self.note_label(keys[0])
         folder = os.path.join(documents_dir(), "Post-it")
         path = os.path.join(folder, "Post-it %s %s.txt" % (which, time.strftime("%Y-%m-%d %H-%M-%S")))
         try:
@@ -1708,19 +1798,27 @@ class PostItApp:
 
         tabs = tk.Frame(h, bg=c["head"])
         tabs.pack(side="left", padx=(self.px(8), self.px(4)))
+        size = self.px(16)
         for i, key in enumerate(ORDER, start=1):
             n = NOTES[key]
-            cur = key == self.data["current"]
-            dot = tk.Frame(tabs, width=self.px(16), height=self.px(16), bg=n["bg"],
-                           cursor="hand2", highlightthickness=2,
-                           highlightbackground=c["ink"] if cur else n["head"])
+            page = self.data["page"][key]
+            dot = tk.Canvas(tabs, width=size, height=size, bg=n["bg"], cursor="hand2",
+                            highlightthickness=0)
             dot.pack(side="left", padx=2)
+            cur = key == self.data["current"]
+            dot.create_rectangle(1, 1, size - 1, size - 1, width=2,
+                                 outline=c["ink"] if cur else n["head"])
+            if cur:  # quale dei due post-it di questo colore è aperto
+                dot.create_text(size / 2, size / 2 + 0.5, text=str(page + 1),
+                                fill=n["ink"], font=self.font(7, bold=True))
             dot.bind("<Button-1>", lambda _e, k=key: self.switch(k))
-            Tooltip(dot, "%s · %s  (%d)" % (n["label"], n["name"], i))
+            other = note_id(key, 1 - page)
+            tip = ("%s · %s  (%d)" % (self.note_label(note_id(key, page)), n["name"], i) +
+                   ("\nClicca di nuovo: %s" % self.note_label(other) if cur else ""))
+            Tooltip(dot, tip)
 
         title = tk.Label(h, text=c["name"], bg=c["head"], fg=c["ink"], font=self.f_head,
                          anchor="w", cursor="fleur")
-        title.pack(side="left", fill="both", expand=True, padx=4)
         self.title_lbl = title
 
         self.icon_button(h, "✕", self.close, "Chiudi", c["ink"]).pack(side="right",
@@ -1732,6 +1830,8 @@ class PostItApp:
         self.icon_button(h, "📌" if on else "📍", self.toggle_topmost,
                          "Sempre in primo piano: " + ("ATTIVO" if on else "SPENTO"),
                          c["ink"] if on else c["soft"]).pack(side="right")
+        # il titolo per ultimo: se un avviso è lungo si accorcia lui, non i pulsanti
+        title.pack(side="left", fill="both", expand=True, padx=4)
 
         for w in (h, title):
             w.bind("<ButtonPress-1>", self.start_move)
@@ -1761,7 +1861,7 @@ class PostItApp:
 
     # ----- note
     def build_notes(self, parent):
-        self.rich = RichNote(self, parent, self.data["current"])
+        self.rich = RichNote(self, parent, self.current_id())
         t = self.notes_widget = self.rich.t
         t.bind("<Button-1>", lambda _e: t.focus_force(), add="+")
         return t

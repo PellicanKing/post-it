@@ -20,6 +20,10 @@ Per averlo a ogni accensione del PC: apri il riquadro delle scorciatoie (simbolo
 - **Verde**: note sopra e attività sotto, divise a metà
 - **Azzurro**: solo note
 
+Ogni colore ha **due post-it** (1 e 2). Per passare all'altro, premi di nuovo la scorciatoia o il numero del colore già aperto, oppure clicca di nuovo il suo quadratino. Il quadratino del colore aperto mostra **1** o **2**.
+
+Il post-it resta sempre dentro lo schermo, anche quando lo trascini o lo ridimensioni. Con due monitor lo porti sull'altro trascinandolo con il mouse.
+
 ## Scorciatoie
 
 Funzionano anche mentre usi altri programmi. Si cambiano dal simbolo della tastiera in basso a destra del post-it.
@@ -27,11 +31,11 @@ Funzionano anche mentre usi altri programmi. Si cambiano dal simbolo della tasti
 | Tasti | Cosa fa |
 |---|---|
 | `Ctrl+Alt+N` | Porta il post-it davanti per scrivere; premuta di nuovo lo nasconde |
-| `Ctrl+Alt+1` / `2` / `3` | Apre il giallo, il verde o l'azzurro |
+| `Ctrl+Alt+1` / `2` / `3` | Apre il giallo, il verde o l'azzurro; premuta di nuovo, passa all'altro post-it dello stesso colore |
 | `Ctrl+Alt+P` | Fisso sopra le altre finestre, oppure no |
 | `Ctrl+Alt+H` | Nasconde o mostra |
 | `Ctrl+Alt+G` | Riduce alla sola barra o espande (modalità grande attivabile) |
-| `1` `2` `3` | Sul post-it, quando non stai scrivendo: cambia colore |
+| `1` `2` `3` | Sul post-it, quando non stai scrivendo: cambia colore; di nuovo lo stesso numero, l'altro dei due |
 | `Esc` | Smetti di scrivere |
 
 ## Scrivere con stile
@@ -45,7 +49,7 @@ Funzionano anche mentre usi altri programmi. Si cambiano dal simbolo della tasti
 | `*testo*` o `Ctrl+B` | **Grassetto** |
 | `_testo_` o `Ctrl+I` | *Corsivo* |
 
-Nelle liste di attività `# Lavoro` crea un titolo di sezione. La freccia in basso a destra esporta un post-it o tutti e tre in un file di testo (in `Documenti\Post-it`).
+Nelle liste di attività `# Lavoro` crea un titolo di sezione. La freccia in basso a destra esporta il post-it aperto, o tutti, in un file di testo (in `Documenti\Post-it`).
 
 I dati restano sul tuo PC, in `%APPDATA%\PostIt\postit.json`.
 
