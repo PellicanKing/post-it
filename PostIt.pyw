@@ -720,14 +720,13 @@ class Popup:
         return lbl
 
     def header(self, title):
-        row = tk.Frame(self.card, bg=self.c["bg"])
-        row.pack(fill="x", pady=(0, self.app.px(6)))
         if IS_MAC:   # il titolo va nella barra della finestra, come nelle app Apple
             self.win.title(title)
-            return row
+            return
+        row = tk.Frame(self.card, bg=self.c["bg"])
+        row.pack(fill="x", pady=(0, self.app.px(6)))
         self.label(row, title, font=self.app.f_head).pack(side="left")
         self.link(row, "✕", self.close, font=self.app.f_icon).pack(side="right")
-        return row
 
     def show(self):
         self.position()
@@ -1657,7 +1656,7 @@ class PostItApp:
             "Post-it", "Post-it %s\nTodo list e note sempre a portata di mano." % VERSION))
         appmenu.add_separator()
         notes = tk.Menu(menubar)
-        menubar.add_cascade(label="Post-it", menu=notes)
+        menubar.add_cascade(label="Note", menu=notes)
         for i, key in enumerate(ORDER, start=1):
             # ⌘1/2/3 li gestisce on_key; qui l'acceleratore serve solo da promemoria
             notes.add_command(label="%s · %s" % (NOTES[key]["label"], NOTES[key]["name"]),
