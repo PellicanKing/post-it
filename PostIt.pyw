@@ -352,7 +352,11 @@ else:
         subprocess.Popen(["open" if IS_MAC else "xdg-open", path])
 
     # un solo Post-it aperto: il secondo avvio chiede al primo di mostrarsi
-    SOCKET_FILE = os.path.join(APP_DIR, "postit.sock")
+    # nella cartella temporanea dell'utente: i percorsi dei socket hanno un limite di lunghezza
+    import tempfile
+    SOCKET_FILE = os.path.join(tempfile.gettempdir(), "postit-%d.sock" % os.getuid())
+    if len(SOCKET_FILE) > 100:
+        SOCKET_FILE = "/tmp/postit-%d.sock" % os.getuid()
     _SERVER = None
 
     def signal_existing_instance():
