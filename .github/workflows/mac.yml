@@ -8,16 +8,24 @@ on:
   release:
     types: [published]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release a cui aggiungere il .dmg (es. v1.3); vuoto = solo prova"
+        required: false
 
 permissions:
   contents: write
 
 jobs:
   mac:
-    runs-on: macos-15
+    # Mac Intel: i Mac Apple Silicon di GitHub sono spesso senza posti liberi.
+    # L'app creata è comunque universale (Apple Silicon e Intel).
+    runs-on: macos-15-intel
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
 
       - name: Python 3.12 universale (python.org, con Tk)
         run: |
@@ -58,7 +66,7 @@ jobs:
             Post-it-Mac.dmg
 
       - name: Aggiunge il .dmg alla release
-        if: github.event_name == 'release'
+        if: github.event_name == 'release' || inputs.tag != ''
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "${{ github.event.release.tag_name }}" Post-it-Mac.dmg --clobber
+        run: gh release upload "${{ github.event.release.tag_name || inputs.tag }}" Post-it-Mac.dmg --clobber
