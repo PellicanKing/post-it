@@ -736,6 +736,18 @@ class Popup:
     def position(self):
         self.win.update_idletasks()
         w, h = self.win.winfo_reqwidth(), self.win.winfo_reqheight()
+        if IS_MAC:   # finestra accanto al post-it (non sopra), ferma in alto a sinistra
+            if self.br is None:
+                r = self.app.root
+                rx, ry, rw = r.winfo_rootx(), r.winfo_rooty(), r.winfo_width()
+                x = rx + rw + 16
+                if x + w > work_area(rx, ry)[2]:
+                    x = rx - w - 16
+                self.br = (x, ry - 28)
+            x, y, _w, _h = fit_rect(self.br[0], self.br[1], w, h)
+            self.win.geometry("+%d+%d" % (x, y))
+            self.win.lift()
+            return
         right, top, bottom = self.anchor
         if self.br is None:
             x, y = right - w, top - h - 6
