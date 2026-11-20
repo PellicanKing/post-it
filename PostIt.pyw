@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-Post-it — todo list e note sempre a portata di mano (Windows 10/11).
+Post-it — todo list e note sempre a portata di mano (Windows 10/11 e macOS).
 
   Giallo  = solo Todo
   Verde   = Note + Todo
   Azzurro = solo Note
 
 Scorciatoie predefinite (attive anche mentre usi altri programmi,
-personalizzabili dal simbolo ⌨ in basso a destra):
+personalizzabili dal simbolo ⌨ in basso a destra; su Mac Ctrl+Alt = ⌃⌥, Ctrl+B = ⌘B):
   Ctrl+Alt+N      scrivi subito (premuta di nuovo: nasconde)
   Ctrl+Alt+P      fisso sopra tutto / non fisso
   Ctrl+Alt+H      nascondi / mostra
@@ -25,28 +25,62 @@ Nelle note:
   *testo* o Ctrl+B        grassetto          _testo_ o Ctrl+I  corsivo
 Nelle liste todo: "# Titolo" crea un titolo di sezione; *attività* in grassetto.
 
-Avvio: doppio clic su questo file (serve Python 3 per Windows) oppure PostIt.exe.
-I dati sono salvati in %APPDATA%\\PostIt\\postit.json
+Avvio: doppio clic su questo file (serve Python 3) oppure PostIt.exe / Post-it.app.
+I dati sono salvati in %APPDATA%\\PostIt (Windows) o ~/Library/Application Support/PostIt
+(Mac), insieme a postit.log, il registro di avvii ed errori.
 """
 import ctypes
 import json
 import os
 import queue
 import re
+import subprocess
 import sys
 import threading
 import time
 import tkinter as tk
-from ctypes import wintypes
-from tkinter import font as tkfont
+import traceback
+from tkinter import font as tkfont, messagebox
 
-# ---------------------------------------------------------------- costanti
+VERSION = "1.3"
+IS_WIN = sys.platform == "win32"
+IS_MAC = sys.platform == "darwin"
+
+# ---------------------------------------------------------------- percorsi
 APP_ID = "PostIt.Note"
-APP_DIR = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"), "PostIt")
+if IS_WIN:
+    APP_DIR = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"), "PostIt")
+elif IS_MAC:
+    APP_DIR = os.path.expanduser("~/Library/Application Support/PostIt")
+else:
+    APP_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+                           "PostIt")
 DATA_FILE = os.path.join(APP_DIR, "postit.json")
+LOG_FILE = os.path.join(APP_DIR, "postit.log")
 BASE_DIR = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
 ICON_FILE = os.path.join(BASE_DIR, "postit.ico")
 
+
+# ---------------------------------------------------------------- registro
+def log(msg):
+    """Annota avvii, chiusure ed errori in postit.log (utile se qualcosa non va)."""
+    try:
+        os.makedirs(APP_DIR, exist_ok=True)
+        if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > 200_000:
+            os.replace(LOG_FILE, LOG_FILE + ".old")
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write("%s  %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg))
+    except OSError:
+        pass
+
+
+def log_error(where, exc=None):
+    exc = exc or sys.exc_info()[1]
+    log("ERRORE in %s:\n%s" % (where, "".join(
+        traceback.format_exception(type(exc), exc, exc.__traceback__)).rstrip()))
+
+
+# ---------------------------------------------------------------- post-it
 NOTES = {
     "yellow": dict(label="Giallo", name="Todo", bg="#fff59d", head="#fbe044",
                    ink="#4a3f00", soft="#a8994a", todo=True, notes=False),
@@ -70,73 +104,443 @@ def note_color(nid):
 NOTE_IDS = [note_id(c, p) for c in ORDER for p in (0, 1)]
 FAINT = "#a9a9a9"
 WARN = "#c62828"
+MAC_GREEN = "#34c759"   # verde degli interruttori di macOS
 
-MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_NOREPEAT = 0x1, 0x2, 0x4, 0x4000
-CA = MOD_CONTROL | MOD_ALT
+# ---------------------------------------------------------------- scorciatoie
+if IS_MAC:
+    # modificatori Carbon e codici dei tasti (posizione sulla tastiera, come su macOS)
+    MOD_CMD, MOD_SHIFT, MOD_ALT, MOD_CONTROL = 0x100, 0x200, 0x800, 0x1000
+    KEYCODES = dict(zip("ASDFHGZXCV", (0, 1, 2, 3, 4, 5, 6, 7, 8, 9)))
+    KEYCODES.update(B=11, Q=12, W=13, E=14, R=15, Y=16, T=17, O=31, U=32, I=34, P=35,
+                    L=37, J=38, K=40, N=45, M=46)
+    KEYCODES.update({"1": 18, "2": 19, "3": 20, "4": 21, "6": 22, "5": 23, "9": 25,
+                     "7": 26, "8": 28, "0": 29, "space": 49, "Return": 36, "Tab": 48,
+                     "Left": 123, "Right": 124, "Down": 125, "Up": 126})
+    KEYCODES.update({"F%d" % (i + 1): c for i, c in enumerate(
+        (122, 120, 99, 118, 96, 97, 98, 100, 101, 109, 103, 111))})
+    KEY_NAMES = {c: k for k, c in KEYCODES.items()}
+    KEY_NAMES.update({49: "Spazio", 36: "↩", 48: "⇥", 123: "←", 124: "→", 125: "↓", 126: "↑"})
+
+    def key_code(ch):
+        return KEYCODES[ch]
+else:
+    MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_CMD = 0x1, 0x2, 0x4, 0x8
+
+    def key_code(ch):
+        return ord(ch)
+MOD_NOREPEAT = 0x4000
+CA = MOD_CONTROL | MOD_ALT   # Ctrl+Alt su Windows, ⌃⌥ su Mac
 ACTIONS = [  # (azione, descrizione, combinazione predefinita)
-    ("write", "Scrivi subito (di nuovo = nascondi)", (CA, ord("N"))),
-    ("pin", "Fisso sopra tutto / non fisso", (CA, ord("P"))),
-    ("hide", "Nascondi / mostra", (CA, ord("H"))),
-    ("expand", "Riduci / espandi", (CA, ord("G"))),
-    ("note:yellow", "Apri giallo (di nuovo: l'altro giallo)", (CA, ord("1"))),
-    ("note:green", "Apri verde (di nuovo: l'altro verde)", (CA, ord("2"))),
-    ("note:blue", "Apri azzurro (di nuovo: l'altro azzurro)", (CA, ord("3"))),
+    ("write", "Scrivi subito (di nuovo = nascondi)", (CA, key_code("N"))),
+    ("pin", "Fisso sopra tutto / non fisso", (CA, key_code("P"))),
+    ("hide", "Nascondi / mostra", (CA, key_code("H"))),
+    ("expand", "Riduci / espandi", (CA, key_code("G"))),
+    ("note:yellow", "Apri giallo (di nuovo: l'altro giallo)", (CA, key_code("1"))),
+    ("note:green", "Apri verde (di nuovo: l'altro verde)", (CA, key_code("2"))),
+    ("note:blue", "Apri azzurro (di nuovo: l'altro azzurro)", (CA, key_code("3"))),
 ]
 ACTION_TEXT = {a: t for a, t, _ in ACTIONS}
 DEFAULT_KEYS = {a: list(k) for a, _, k in ACTIONS}
 MODIFIER_KEYSYMS = {"Control_L", "Control_R", "Alt_L", "Alt_R", "Shift_L", "Shift_R",
                     "Win_L", "Win_R", "Super_L", "Super_R", "Caps_Lock", "Num_Lock",
-                    "ISO_Level3_Shift", "App"}
+                    "ISO_Level3_Shift", "App", "Meta_L", "Meta_R", "Option_L", "Option_R"}
 
-# ---------------------------------------------------------------- Win32
-user32 = ctypes.WinDLL("user32", use_last_error=True)
-kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-HWND, HANDLE, UINT, DWORD = wintypes.HWND, wintypes.HANDLE, wintypes.UINT, wintypes.DWORD
-for fn, args, res in [
-    (user32.GetParent, [HWND], HWND),
-    (user32.GetForegroundWindow, [], HWND),
-    (user32.GetWindowThreadProcessId, [HWND, ctypes.c_void_p], DWORD),
-    (user32.AttachThreadInput, [DWORD, DWORD, wintypes.BOOL], wintypes.BOOL),
-    (user32.BringWindowToTop, [HWND], wintypes.BOOL),
-    (user32.SetForegroundWindow, [HWND], wintypes.BOOL),
-    (user32.GetWindowLongW, [HWND, ctypes.c_int], ctypes.c_long),
-    (user32.SetWindowLongW, [HWND, ctypes.c_int, ctypes.c_long], ctypes.c_long),
-    (user32.RegisterHotKey, [HWND, ctypes.c_int, UINT, UINT], wintypes.BOOL),
-    (user32.UnregisterHotKey, [HWND, ctypes.c_int], wintypes.BOOL),
-    (user32.GetMessageW, [ctypes.POINTER(wintypes.MSG), HWND, UINT, UINT], wintypes.BOOL),
-    (user32.PeekMessageW, [ctypes.POINTER(wintypes.MSG), HWND, UINT, UINT, UINT], wintypes.BOOL),
-    (user32.PostThreadMessageW, [DWORD, UINT, wintypes.WPARAM, wintypes.LPARAM], wintypes.BOOL),
-    (user32.MapVirtualKeyW, [UINT, UINT], UINT),
-    (user32.GetKeyNameTextW, [ctypes.c_long, wintypes.LPWSTR, ctypes.c_int], ctypes.c_int),
-    (kernel32.GetCurrentThreadId, [], DWORD),
-    (kernel32.CreateMutexW, [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR], HANDLE),
-    (kernel32.CreateEventW, [ctypes.c_void_p, wintypes.BOOL, wintypes.BOOL, wintypes.LPCWSTR], HANDLE),
-    (kernel32.SetEvent, [HANDLE], wintypes.BOOL),
-    (kernel32.WaitForSingleObject, [HANDLE, DWORD], DWORD),
-]:
-    fn.argtypes, fn.restype = args, res
+# ---------------------------------------------------------------- Windows
+if IS_WIN:
+    from ctypes import wintypes
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    HWND, HANDLE, UINT, DWORD = wintypes.HWND, wintypes.HANDLE, wintypes.UINT, wintypes.DWORD
 
+    class MONITORINFO(ctypes.Structure):
+        _fields_ = [("cbSize", DWORD), ("rcMonitor", wintypes.RECT),
+                    ("rcWork", wintypes.RECT), ("dwFlags", DWORD)]
 
-class MONITORINFO(ctypes.Structure):
-    _fields_ = [("cbSize", DWORD), ("rcMonitor", wintypes.RECT),
-                ("rcWork", wintypes.RECT), ("dwFlags", DWORD)]
+    for fn, args, res in [
+        (user32.GetParent, [HWND], HWND),
+        (user32.GetForegroundWindow, [], HWND),
+        (user32.GetWindowThreadProcessId, [HWND, ctypes.c_void_p], DWORD),
+        (user32.AttachThreadInput, [DWORD, DWORD, wintypes.BOOL], wintypes.BOOL),
+        (user32.BringWindowToTop, [HWND], wintypes.BOOL),
+        (user32.SetForegroundWindow, [HWND], wintypes.BOOL),
+        (user32.GetWindowLongW, [HWND, ctypes.c_int], ctypes.c_long),
+        (user32.SetWindowLongW, [HWND, ctypes.c_int, ctypes.c_long], ctypes.c_long),
+        (user32.RegisterHotKey, [HWND, ctypes.c_int, UINT, UINT], wintypes.BOOL),
+        (user32.UnregisterHotKey, [HWND, ctypes.c_int], wintypes.BOOL),
+        (user32.GetMessageW, [ctypes.POINTER(wintypes.MSG), HWND, UINT, UINT], wintypes.BOOL),
+        (user32.PeekMessageW, [ctypes.POINTER(wintypes.MSG), HWND, UINT, UINT, UINT],
+         wintypes.BOOL),
+        (user32.PostThreadMessageW, [DWORD, UINT, wintypes.WPARAM, wintypes.LPARAM],
+         wintypes.BOOL),
+        (user32.MapVirtualKeyW, [UINT, UINT], UINT),
+        (user32.GetKeyNameTextW, [ctypes.c_long, wintypes.LPWSTR, ctypes.c_int], ctypes.c_int),
+        (user32.MonitorFromPoint, [wintypes.POINT, DWORD], HANDLE),
+        (user32.GetMonitorInfoW, [HANDLE, ctypes.POINTER(MONITORINFO)], wintypes.BOOL),
+        (kernel32.GetCurrentThreadId, [], DWORD),
+        (kernel32.CreateMutexW, [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR], HANDLE),
+        (kernel32.CreateEventW, [ctypes.c_void_p, wintypes.BOOL, wintypes.BOOL,
+                                 wintypes.LPCWSTR], HANDLE),
+        (kernel32.SetEvent, [HANDLE], wintypes.BOOL),
+        (kernel32.WaitForSingleObject, [HANDLE, DWORD], DWORD),
+    ]:
+        fn.argtypes, fn.restype = args, res
 
+    def work_area(x, y):
+        """(sinistra, alto, destra, basso) dello schermo più vicino al punto,
+        senza la barra delle applicazioni."""
+        mi = MONITORINFO()
+        mi.cbSize = ctypes.sizeof(mi)
+        mon = user32.MonitorFromPoint(wintypes.POINT(int(x), int(y)), 2)  # il più vicino
+        if mon and user32.GetMonitorInfoW(mon, ctypes.byref(mi)):
+            r = mi.rcWork
+            return r.left, r.top, r.right, r.bottom
+        return 0, 0, user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
 
-user32.MonitorFromPoint.argtypes, user32.MonitorFromPoint.restype = [wintypes.POINT, DWORD], HANDLE
-user32.GetMonitorInfoW.argtypes = [HANDLE, ctypes.POINTER(MONITORINFO)]
-user32.GetMonitorInfoW.restype = wintypes.BOOL
+    def vk_name(vk):
+        if 0x30 <= vk <= 0x39 or 0x41 <= vk <= 0x5A:
+            return chr(vk)
+        if 0x70 <= vk <= 0x87:
+            return "F%d" % (vk - 0x6F)
+        if 0x60 <= vk <= 0x69:
+            return "Num%d" % (vk - 0x60)
+        named = {0x20: "Spazio", 0x0D: "Invio", 0x09: "Tab", 0x2D: "Ins", 0x2E: "Canc",
+                 0x24: "Home", 0x23: "Fine", 0x21: "PagSu", 0x22: "PagGiù",
+                 0x25: "←", 0x26: "↑", 0x27: "→", 0x28: "↓"}
+        if vk in named:
+            return named[vk]
+        buf = ctypes.create_unicode_buffer(32)
+        if user32.GetKeyNameTextW(user32.MapVirtualKeyW(vk, 0) << 16, buf, 32):
+            return buf.value
+        return "VK%d" % vk
 
+    RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+    RUN_NAME = "PostIt"
 
-def work_area(x, y):
-    """(sinistra, alto, destra, basso) dello schermo più vicino al punto,
-    senza la barra delle applicazioni."""
-    mi = MONITORINFO()
-    mi.cbSize = ctypes.sizeof(mi)
-    mon = user32.MonitorFromPoint(wintypes.POINT(int(x), int(y)), 2)  # il più vicino
-    if mon and user32.GetMonitorInfoW(mon, ctypes.byref(mi)):
-        r = mi.rcWork
-        return r.left, r.top, r.right, r.bottom
-    return 0, 0, user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
+    def autostart_command():
+        """Comando che Windows esegue all'accesso (exe oppure pythonw + script)."""
+        if getattr(sys, "frozen", False):
+            return '"%s" --autostart' % sys.executable
+        exe = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+        if not os.path.exists(exe):
+            exe = sys.executable
+        return '"%s" "%s" --autostart' % (exe, os.path.abspath(__file__))
+
+    def autostart_enabled():
+        import winreg
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
+                winreg.QueryValueEx(k, RUN_NAME)
+            return True
+        except OSError:
+            return False
+
+    def set_autostart(on):
+        """Aggiunge o toglie il Post-it dai programmi che partono all'accesso a Windows."""
+        import winreg
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:
+                if on:
+                    winreg.SetValueEx(k, RUN_NAME, 0, winreg.REG_SZ, autostart_command())
+                else:
+                    try:
+                        winreg.DeleteValue(k, RUN_NAME)
+                    except FileNotFoundError:
+                        pass
+            return True
+        except OSError:
+            return False
+
+    def documents_dir():
+        buf = ctypes.create_unicode_buffer(260)
+        if ctypes.windll.shell32.SHGetFolderPathW(None, 5, None, 0, buf) == 0 and buf.value:
+            return buf.value
+        return os.path.join(os.path.expanduser("~"), "Documents")
+
+    def open_path(path):
+        os.startfile(path)
+
+    _MUTEX = None
+
+    def signal_existing_instance():
+        """True se il Post-it è già aperto: in quel caso gli chiede di mostrarsi."""
+        global _MUTEX
+        ctypes.set_last_error(0)
+        _MUTEX = kernel32.CreateMutexW(None, False, "PostIt.SingleInstance")
+        if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
+            ev = kernel32.CreateEventW(None, False, False, "PostIt.Show")
+            if ev:
+                kernel32.SetEvent(ev)
+            return True
+        return False
+
+    def listen_show_requests(events):
+        ev = kernel32.CreateEventW(None, False, False, "PostIt.Show")
+        while ev:
+            r = kernel32.WaitForSingleObject(ev, 0xFFFFFFFF)
+            if r == 0:
+                events.put(("show", None))
+            elif r == 0xFFFFFFFF:   # attesa fallita: meglio smettere che girare a vuoto
+                log("attesa delle richieste di apertura interrotta")
+                return
+
+    class HotkeyThread(threading.Thread):
+        """Registra le scorciatoie in Windows: le combinazioni arrivano solo al Post-it,
+        non agli altri programmi. Le registrazioni vivono in questo thread."""
+        WM_HOTKEY, WM_RELOAD, WM_SUSPEND = 0x0312, 0x8001, 0x8002
+
+        def __init__(self, events, bindings):
+            super().__init__(daemon=True)
+            self.events, self.bindings = events, dict(bindings)
+            self.ids, self.tid, self.ready = {}, 0, threading.Event()
+
+        def run(self):
+            self.tid = kernel32.GetCurrentThreadId()
+            msg = wintypes.MSG()
+            user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 0)  # crea la coda messaggi
+            self.ready.set()
+            self._register()
+            while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+                if msg.message == self.WM_HOTKEY and msg.wParam in self.ids:
+                    self.events.put(("hotkey", self.ids[msg.wParam]))
+                elif msg.message == self.WM_RELOAD:
+                    self._unregister()
+                    self._register()
+                elif msg.message == self.WM_SUSPEND:
+                    self._unregister()
+
+        def _register(self):
+            failed = []
+            for i, (action, (mods, vk)) in enumerate(sorted(self.bindings.items()), start=1):
+                if user32.RegisterHotKey(None, i, mods | MOD_NOREPEAT, vk):
+                    self.ids[i] = action
+                else:
+                    failed.append(action)
+            self.events.put(("status", failed))
+
+        def _unregister(self):
+            for i in self.ids:
+                user32.UnregisterHotKey(None, i)
+            self.ids.clear()
+
+        def _post(self, message):
+            if self.ready.wait(2):
+                user32.PostThreadMessageW(self.tid, message, 0, 0)
+
+        def reload(self, bindings):
+            self.bindings = dict(bindings)
+            self._post(self.WM_RELOAD)
+
+        def suspend(self):
+            self._post(self.WM_SUSPEND)
+
+    def make_hotkeys(events, bindings):
+        h = HotkeyThread(events, bindings)
+        h.start()
+        return h
+
+# ---------------------------------------------------------------- macOS e altri sistemi
+else:
+    _SCREEN = [0, 0, 1440, 900]   # area utile, aggiornata da PostItApp con le misure vere
+
+    def work_area(_x, _y):
+        return tuple(_SCREEN)
+
+    def documents_dir():
+        return os.path.join(os.path.expanduser("~"), "Documents")
+
+    def open_path(path):
+        subprocess.Popen(["open" if IS_MAC else "xdg-open", path])
+
+    # un solo Post-it aperto: il secondo avvio chiede al primo di mostrarsi
+    SOCKET_FILE = os.path.join(APP_DIR, "postit.sock")
+    _SERVER = None
+
+    def signal_existing_instance():
+        global _SERVER
+        import socket
+        try:
+            os.makedirs(APP_DIR, exist_ok=True)
+            s = socket.socket(socket.AF_UNIX)
+            try:
+                s.connect(SOCKET_FILE)
+                s.sendall(b"show")
+                return True
+            except OSError:
+                pass
+            finally:
+                s.close()
+            if os.path.exists(SOCKET_FILE):
+                os.unlink(SOCKET_FILE)
+            _SERVER = socket.socket(socket.AF_UNIX)
+            _SERVER.bind(SOCKET_FILE)
+            _SERVER.listen(4)
+        except OSError:
+            log_error("controllo istanza unica")
+            _SERVER = None
+        return False
+
+    def listen_show_requests(events):
+        while _SERVER is not None:
+            try:
+                conn, _addr = _SERVER.accept()
+            except OSError:
+                return
+            conn.close()
+            events.put(("show", None))
+
+    if IS_MAC:
+        LAUNCH_AGENT = os.path.expanduser("~/Library/LaunchAgents/it.postit.note.plist")
+
+        def autostart_args():
+            if getattr(sys, "frozen", False):
+                app = os.path.abspath(os.path.join(os.path.dirname(sys.executable), "..", ".."))
+                if app.endswith(".app"):
+                    return ["/usr/bin/open", "-a", app, "--args", "--autostart"]
+                return [sys.executable, "--autostart"]
+            return [sys.executable, os.path.abspath(__file__), "--autostart"]
+
+        def autostart_enabled():
+            return os.path.exists(LAUNCH_AGENT)
+
+        def set_autostart(on):
+            """Avvio all'accesso a macOS tramite un LaunchAgent dell'utente."""
+            import plistlib
+            try:
+                if on:
+                    os.makedirs(os.path.dirname(LAUNCH_AGENT), exist_ok=True)
+                    with open(LAUNCH_AGENT, "wb") as f:
+                        plistlib.dump({"Label": "it.postit.note", "RunAtLoad": True,
+                                       "ProgramArguments": autostart_args(),
+                                       "ProcessType": "Interactive"}, f)
+                elif os.path.exists(LAUNCH_AGENT):
+                    os.remove(LAUNCH_AGENT)
+                return True
+            except OSError:
+                return False
+
+        _OBJC = None
+
+        def objc_call(obj, sel, restype=ctypes.c_void_p, argtypes=(), *args):
+            """Chiamata minima all'Objective-C (per portare l'app in primo piano)."""
+            global _OBJC
+            import ctypes.util
+            if _OBJC is None:
+                _OBJC = ctypes.CDLL(ctypes.util.find_library("objc"))
+                _OBJC.objc_getClass.restype = ctypes.c_void_p
+                _OBJC.objc_getClass.argtypes = [ctypes.c_char_p]
+                _OBJC.sel_registerName.restype = ctypes.c_void_p
+                _OBJC.sel_registerName.argtypes = [ctypes.c_char_p]
+            if isinstance(obj, bytes):
+                obj = _OBJC.objc_getClass(obj)
+            addr = ctypes.cast(_OBJC.objc_msgSend, ctypes.c_void_p).value
+            f = ctypes.CFUNCTYPE(restype, ctypes.c_void_p, ctypes.c_void_p, *argtypes)(addr)
+            return f(obj, _OBJC.sel_registerName(sel), *args)
+
+        def mac_app(method, restype=None, argtypes=(), *args):
+            try:
+                nsapp = objc_call(b"NSApplication", b"sharedApplication")
+                return objc_call(nsapp, method, restype, argtypes, *args)
+            except Exception:  # noqa: BLE001 — una funzione in meno, non un crash
+                log_error("macOS " + method.decode())
+                return None
+
+        class MacHotkeys:
+            """Scorciatoie globali su macOS con RegisterEventHotKey (Carbon): funzionano
+            senza permessi di Accessibilità e non arrivano alle altre app."""
+
+            def __init__(self, events, bindings):
+                from ctypes import c_uint32, c_void_p, POINTER, Structure, byref
+                self.events, self.bindings, self.refs = events, dict(bindings), {}
+
+                class HotKeyID(Structure):
+                    _fields_ = [("signature", c_uint32), ("id", c_uint32)]
+
+                class EventTypeSpec(Structure):
+                    _fields_ = [("eventClass", c_uint32), ("eventKind", c_uint32)]
+                self.HotKeyID = HotKeyID
+                c = self.carbon = ctypes.CDLL(
+                    "/System/Library/Frameworks/Carbon.framework/Carbon")
+                handler_t = ctypes.CFUNCTYPE(ctypes.c_int32, c_void_p, c_void_p, c_void_p)
+                c.GetApplicationEventTarget.restype = c_void_p
+                c.InstallEventHandler.argtypes = [c_void_p, handler_t, c_uint32,
+                                                  POINTER(EventTypeSpec), c_void_p,
+                                                  POINTER(c_void_p)]
+                c.RegisterEventHotKey.argtypes = [c_uint32, c_uint32, HotKeyID, c_void_p,
+                                                  c_uint32, POINTER(c_void_p)]
+                c.UnregisterEventHotKey.argtypes = [c_void_p]
+                c.GetEventParameter.argtypes = [c_void_p, c_uint32, c_uint32, c_void_p,
+                                                ctypes.c_ulong, c_void_p, c_void_p]
+                self.sig = int.from_bytes(b"PstI", "big")
+                self._handler = handler_t(self._on_event)   # tenuto in vita qui
+                spec = EventTypeSpec(int.from_bytes(b"keyb", "big"), 5)  # tasto premuto
+                self._ref = c_void_p()
+                c.InstallEventHandler(c.GetApplicationEventTarget(), self._handler, 1,
+                                      byref(spec), None, byref(self._ref))
+                self._register()
+
+            def _on_event(self, _call, event, _data):
+                try:
+                    hk = self.HotKeyID()
+                    self.carbon.GetEventParameter(
+                        event, int.from_bytes(b"----", "big"), int.from_bytes(b"hkid", "big"),
+                        None, ctypes.sizeof(hk), None, ctypes.byref(hk))
+                    action = self.refs.get(hk.id, (None, None))[0]
+                    if hk.signature == self.sig and action:
+                        self.events.put(("hotkey", action))
+                except Exception:  # noqa: BLE001
+                    log_error("scorciatoia macOS")
+                return 0
+
+            def _register(self):
+                failed = []
+                target = self.carbon.GetApplicationEventTarget()
+                for i, (action, (mods, code)) in enumerate(sorted(self.bindings.items()), 1):
+                    ref = ctypes.c_void_p()
+                    err = self.carbon.RegisterEventHotKey(code, mods, self.HotKeyID(self.sig, i),
+                                                          target, 0, ctypes.byref(ref))
+                    if err == 0:
+                        self.refs[i] = (action, ref)
+                    else:
+                        failed.append(action)
+                self.events.put(("status", failed))
+
+            def _unregister(self):
+                for _action, ref in self.refs.values():
+                    self.carbon.UnregisterEventHotKey(ref)
+                self.refs.clear()
+
+            def reload(self, bindings):
+                self.bindings = dict(bindings)
+                self._unregister()
+                self._register()
+
+            def suspend(self):
+                self._unregister()
+    else:
+        def autostart_enabled():
+            return False
+
+        def set_autostart(_on):
+            return False
+
+    class NoHotkeys:
+        def __init__(self, events, bindings):
+            self.events, self.bindings = events, bindings
+            self.reload(bindings)
+
+        def reload(self, bindings):
+            self.events.put(("status", sorted(bindings)))
+
+        def suspend(self):
+            pass
+
+    def make_hotkeys(events, bindings):
+        if IS_MAC:
+            try:
+                return MacHotkeys(events, bindings)
+            except Exception:  # noqa: BLE001
+                log_error("scorciatoie macOS")
+        return NoHotkeys(events, bindings)
 
 
 def fit_rect(x, y, w, h, point=None):
@@ -146,77 +550,35 @@ def fit_rect(x, y, w, h, point=None):
     return max(left, min(x, right - w)), max(top, min(y, bottom - h)), w, h
 
 
-def vk_name(vk):
-    if 0x30 <= vk <= 0x39 or 0x41 <= vk <= 0x5A:
-        return chr(vk)
-    if 0x70 <= vk <= 0x87:
-        return "F%d" % (vk - 0x6F)
-    if 0x60 <= vk <= 0x69:
-        return "Num%d" % (vk - 0x60)
-    named = {0x20: "Spazio", 0x0D: "Invio", 0x09: "Tab", 0x2D: "Ins", 0x2E: "Canc",
-             0x24: "Home", 0x23: "Fine", 0x21: "PagSu", 0x22: "PagGiù",
-             0x25: "←", 0x26: "↑", 0x27: "→", 0x28: "↓"}
-    if vk in named:
-        return named[vk]
-    buf = ctypes.create_unicode_buffer(32)
-    if user32.GetKeyNameTextW(user32.MapVirtualKeyW(vk, 0) << 16, buf, 32):
-        return buf.value
-    return "VK%d" % vk
-
-
 def combo_label(combo):
-    mods, vk = combo
+    mods, key = combo
+    if IS_MAC:
+        sym = "".join(s for m, s in ((MOD_CONTROL, "⌃"), (MOD_ALT, "⌥"), (MOD_SHIFT, "⇧"),
+                                     (MOD_CMD, "⌘")) if mods & m)
+        return sym + KEY_NAMES.get(key, "#%d" % key)
     parts = [n for m, n in ((MOD_CONTROL, "Ctrl"), (MOD_ALT, "Alt"), (MOD_SHIFT, "Maiusc"))
              if mods & m]
-    return "+".join(parts + [vk_name(vk)])
+    return "+".join(parts + [vk_name(key)])
 
 
-RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
-RUN_NAME = "PostIt"
+def event_combo(e):
+    """Tasto premuto in Tk -> [modificatori, tasto] nel formato delle scorciatoie globali."""
+    if IS_MAC:  # Tk su Mac: ⌘ = Mod1 (0x8), ⌥ = Mod2 (0x10); il codice tasto è nel byte alto
+        mods = ((MOD_CONTROL if e.state & 0x4 else 0) | (MOD_ALT if e.state & 0x10 else 0)
+                | (MOD_SHIFT if e.state & 0x1 else 0) | (MOD_CMD if e.state & 0x8 else 0))
+        code = e.keycode >> 24 if e.keycode > 0xFFFFFF else None
+        if code is None:
+            ks = e.keysym.upper() if len(e.keysym) == 1 else e.keysym
+            code = KEYCODES.get(ks)
+        return [mods, code]
+    mods = ((MOD_CONTROL if e.state & 0x4 else 0) | (MOD_ALT if e.state & 0x20000 else 0)
+            | (MOD_SHIFT if e.state & 0x1 else 0))
+    return [mods, e.keycode]
 
 
-def autostart_command():
-    """Comando che Windows esegue all'accesso (exe oppure pythonw + script)."""
-    if getattr(sys, "frozen", False):
-        return '"%s"' % sys.executable
-    exe = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
-    if not os.path.exists(exe):
-        exe = sys.executable
-    return '"%s" "%s"' % (exe, os.path.abspath(__file__))
-
-
-def autostart_enabled():
-    import winreg
-    try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
-            winreg.QueryValueEx(k, RUN_NAME)
-        return True
-    except OSError:
-        return False
-
-
-def set_autostart(on):
-    """Aggiunge o toglie il Post-it dai programmi che partono all'accesso a Windows."""
-    import winreg
-    try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:
-            if on:
-                winreg.SetValueEx(k, RUN_NAME, 0, winreg.REG_SZ, autostart_command())
-            else:
-                try:
-                    winreg.DeleteValue(k, RUN_NAME)
-                except FileNotFoundError:
-                    pass
-        return True
-    except OSError:
-        return False
-
-
-def documents_dir():
-    buf = ctypes.create_unicode_buffer(260)
-    if ctypes.windll.shell32.SHGetFolderPathW(None, 5, None, 0, buf) == 0 and buf.value:
-        return buf.value
-    return os.path.join(os.path.expanduser("~"), "Documents")
+def combo_allowed(mods):
+    """Serve almeno Ctrl/Alt (Windows) o ⌃/⌘ (Mac): da sola ⌥ è bloccata da macOS."""
+    return bool(mods & (MOD_CONTROL | MOD_CMD)) if IS_MAC else bool(mods & CA)
 
 
 # ---------------------------------------------------------------- dati
@@ -232,14 +594,26 @@ def load_data():
     try:
         with open(DATA_FILE, "r", encoding="utf-8") as f:
             saved = json.load(f)
+    except FileNotFoundError:
+        return data
     except (OSError, ValueError):
+        log_error("lettura di postit.json")
+        try:   # file rovinato: lo teniamo da parte invece di sovrascriverlo
+            os.replace(DATA_FILE, DATA_FILE + ".rovinato-%d" % int(time.time()))
+        except OSError:
+            pass
         return data
     for key in ("current", "topmost", "geometry", "large_mode"):
         if key in saved:
             data[key] = saved[key]
     for action, combo in (saved.get("hotkeys") or {}).items():
         if action in DEFAULT_KEYS and isinstance(combo, list) and len(combo) == 2:
-            data["hotkeys"][action] = [int(combo[0]), int(combo[1])]
+            try:
+                combo = [int(combo[0]), int(combo[1])]
+            except (TypeError, ValueError):
+                continue
+            if combo_allowed(combo[0]):
+                data["hotkeys"][action] = combo
     for color, page in (saved.get("page") or {}).items():
         if color in NOTES and page in (0, 1):
             data["page"][color] = page
@@ -259,82 +633,10 @@ def load_data():
     return data
 
 
-# ---------------------------------------------------------------- servizi di sistema
-_MUTEX = None
-
-
-def signal_existing_instance():
-    """True se il Post-it è già aperto: in quel caso gli chiede di mostrarsi."""
-    global _MUTEX
-    ctypes.set_last_error(0)
-    _MUTEX = kernel32.CreateMutexW(None, False, "PostIt.SingleInstance")
-    if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
-        ev = kernel32.CreateEventW(None, False, False, "PostIt.Show")
-        if ev:
-            kernel32.SetEvent(ev)
-        return True
-    return False
-
-
-def listen_show_requests(events):
-    ev = kernel32.CreateEventW(None, False, False, "PostIt.Show")
-    while ev:
-        if kernel32.WaitForSingleObject(ev, 0xFFFFFFFF) == 0:
-            events.put(("show", None))
-
-
-class HotkeyThread(threading.Thread):
-    """Registra le scorciatoie in Windows: le combinazioni arrivano solo al Post-it,
-    non agli altri programmi. Le registrazioni vivono in questo thread."""
-    WM_HOTKEY, WM_RELOAD, WM_SUSPEND = 0x0312, 0x8001, 0x8002
-
-    def __init__(self, events, bindings):
-        super().__init__(daemon=True)
-        self.events, self.bindings = events, dict(bindings)
-        self.ids, self.tid, self.ready = {}, 0, threading.Event()
-
-    def run(self):
-        self.tid = kernel32.GetCurrentThreadId()
-        msg = wintypes.MSG()
-        user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 0)  # crea la coda messaggi
-        self.ready.set()
-        self._register()
-        while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
-            if msg.message == self.WM_HOTKEY and msg.wParam in self.ids:
-                self.events.put(("hotkey", self.ids[msg.wParam]))
-            elif msg.message == self.WM_RELOAD:
-                self._unregister()
-                self._register()
-            elif msg.message == self.WM_SUSPEND:
-                self._unregister()
-
-    def _register(self):
-        failed = []
-        for i, (action, (mods, vk)) in enumerate(sorted(self.bindings.items()), start=1):
-            if user32.RegisterHotKey(None, i, mods | MOD_NOREPEAT, vk):
-                self.ids[i] = action
-            else:
-                failed.append(action)
-        self.events.put(("status", failed))
-
-    def _unregister(self):
-        for i in self.ids:
-            user32.UnregisterHotKey(None, i)
-        self.ids.clear()
-
-    def _post(self, message):
-        if self.ready.wait(2):
-            user32.PostThreadMessageW(self.tid, message, 0, 0)
-
-    def reload(self, bindings):
-        self.bindings = dict(bindings)
-        self._post(self.WM_RELOAD)
-
-    def suspend(self):
-        self._post(self.WM_SUSPEND)
-
-
 # ---------------------------------------------------------------- piccoli componenti grafici
+UI_FONT = ["Segoe UI", 0]   # famiglia e scarto di dimensione (su Mac: San Francisco, +2)
+
+
 class Tooltip:
     def __init__(self, widget, text):
         self.widget, self.text, self.tip = widget, text, None
@@ -349,7 +651,7 @@ class Tooltip:
         self.tip.overrideredirect(True)
         self.tip.attributes("-topmost", True)
         tk.Label(self.tip, text=self.text, bg="#333333", fg="white", padx=6, pady=2,
-                 font=("Segoe UI", 9)).pack()
+                 font=(UI_FONT[0], 9 + UI_FONT[1])).pack()
         self.tip.update_idletasks()
         w, h = self.tip.winfo_reqwidth(), self.tip.winfo_reqheight()
         wx, wy = self.widget.winfo_rootx(), self.widget.winfo_rooty()
@@ -366,21 +668,29 @@ class Tooltip:
 
 
 class Popup:
-    """Riquadro in stile post-it (niente finestre di Windows). Si chiude con Esc
-    o cliccando altrove; resta ancorato in basso a destra quando cambia misura."""
+    """Riquadro in stile post-it. Su Windows è disegnato a mano (niente finestre di
+    sistema) e si chiude con Esc o cliccando altrove; su Mac è una vera finestra macOS
+    (angoli arrotondati, ombra, pulsante rosso). Resta ancorato in basso a destra."""
 
     def __init__(self, app, anchor):
         app.close_popup()
         app.popup = self
         self.app, self.c, self.br = app, app.c, None
         self.win = tk.Toplevel(app.root)
-        self.win.overrideredirect(True)
+        if IS_MAC:
+            self.win.resizable(False, False)
+            self.win.transient(app.root)
+            self.win.protocol("WM_DELETE_WINDOW", self.close)
+            self.win.bind("<Command-w>", lambda _e: (self.close(), "break")[1])
+        else:
+            self.win.overrideredirect(True)
+            self.win.bind("<FocusOut>", lambda _e: self.win.after(120, self.check_focus))
         self.win.attributes("-topmost", True)
-        self.win.configure(bg=self.c["head"])
-        self.card = tk.Frame(self.win, bg=self.c["bg"], padx=app.px(12), pady=app.px(10))
+        self.win.configure(bg=self.c["bg"] if IS_MAC else self.c["head"])
+        self.card = tk.Frame(self.win, bg=self.c["bg"], padx=app.px(14 if IS_MAC else 12),
+                             pady=app.px(12 if IS_MAC else 10))
         self.card.pack(padx=1, pady=1)
         self.win.bind("<Escape>", lambda _e: self.close())
-        self.win.bind("<FocusOut>", lambda _e: self.win.after(120, self.check_focus))
         self.anchor = (anchor.winfo_rootx() + anchor.winfo_width(), anchor.winfo_rooty(),
                        anchor.winfo_rooty() + anchor.winfo_height())
 
@@ -408,6 +718,9 @@ class Popup:
     def header(self, title):
         row = tk.Frame(self.card, bg=self.c["bg"])
         row.pack(fill="x", pady=(0, self.app.px(6)))
+        if IS_MAC:   # il titolo va nella barra della finestra, come nelle app Apple
+            self.win.title(title)
+            return row
         self.label(row, title, font=self.app.f_head).pack(side="left")
         self.link(row, "✕", self.close, font=self.app.f_icon).pack(side="right")
         return row
@@ -456,7 +769,8 @@ class ExportMenu(Popup):
     def __init__(self, app, anchor):
         super().__init__(app, anchor)
         self.header("Esporta")
-        self.label(self.card, "Salva un file di testo in Documenti\\Post-it",
+        self.label(self.card, "Salva un file di testo in %s" % (
+                       "Documenti/Post-it" if IS_MAC else "Documenti\\Post-it"),
                    font=app.f_small, fg=self.c["soft"]).pack(anchor="w", pady=(0, app.px(4)))
         self.menu_item(self.card, "Questo post-it (%s)" % app.note_label(app.current_id()),
                        lambda: self.done(app.export([app.current_id()])))
@@ -464,8 +778,9 @@ class ExportMenu(Popup):
         self.show()
 
     def done(self, path):
+        pad = self.card.cget("padx"), self.card.cget("pady")
         self.card.destroy()
-        self.card = tk.Frame(self.win, bg=self.c["bg"], padx=self.app.px(12), pady=self.app.px(10))
+        self.card = tk.Frame(self.win, bg=self.c["bg"], padx=pad[0], pady=pad[1])
         self.card.pack(padx=1, pady=1)
         if not path:
             self.header("Esportazione non riuscita")
@@ -476,11 +791,11 @@ class ExportMenu(Popup):
             self.label(self.card, os.path.basename(path), font=self.app.f_small).pack(anchor="w")
             row = tk.Frame(self.card, bg=self.c["bg"])
             row.pack(anchor="w", pady=(self.app.px(6), 0))
-            self.link(row, "Apri file", lambda: (os.startfile(path), self.close()),
+            self.link(row, "Apri file", lambda: (open_path(path), self.close()),
                       fg=self.c["ink"]).pack(side="left")
             self.label(row, "  ·  ", font=self.app.f_small, fg=self.c["soft"]).pack(side="left")
-            self.link(row, "Apri cartella",
-                      lambda: (os.startfile(os.path.dirname(path)), self.close()),
+            self.link(row, "Mostra nel Finder" if IS_MAC else "Apri cartella",
+                      lambda: (open_path(os.path.dirname(path)), self.close()),
                       fg=self.c["ink"]).pack(side="left")
         self.position()
         self.win.after(10000, lambda: self.win.winfo_exists() and self.close())
@@ -544,19 +859,26 @@ class SettingsPanel(Popup):
         row.pack(fill="x", pady=(px(8), 0))
         text = tk.Frame(row, bg=c["bg"])
         text.pack(side="left", fill="x", expand=True)
-        self.label(text, "Avvia con Windows", font=app.f_small_b).pack(anchor="w")
-        self.label(text, "Si apre da solo quando accendi il PC,\ncosì le scorciatoie funzionano subito",
+        self.label(text, "Apri al login" if IS_MAC else "Avvia con Windows",
+                   font=app.f_small_b).pack(anchor="w")
+        self.label(text, "Si apre da solo quando accendi %s,\ncosì le scorciatoie funzionano "
+                         "subito" % ("il Mac" if IS_MAC else "il PC"),
                    font=app.f_small, fg=c["soft"], justify="left").pack(anchor="w")
         self.switch(row, autostart_enabled(), self.toggle_autostart).pack(side="right")
 
         self.separator()
+        cmd = "⌘" if IS_MAC else "Ctrl+"
         self.label(self.card, "Sul post-it:  1·2·3 cambia colore (di nuovo: l'altro dello stesso"
-                              " colore)\nInvio scrivi  ·  Esc esci\n"
-                              "Note:  # titolo  ·  - elenco  ·  1. numerato  ·  *grassetto* (Ctrl+B)"
-                              "  ·  _corsivo_ (Ctrl+I)",
+                              " colore)\nInvio scrivi  ·  Esc esci  ·  ✕ nasconde (non chiude)\n"
+                              "Note:  # titolo  ·  - elenco  ·  1. numerato  ·  *grassetto* "
+                              "(%sB)  ·  _corsivo_ (%sI)" % (cmd, cmd),
                    font=app.f_small, fg=c["soft"], justify="left").pack(anchor="w")
-        self.link(self.card, "Ripristina predefinite", self.reset).pack(anchor="w",
-                                                                         pady=(px(6), 0))
+        row = tk.Frame(self.card, bg=c["bg"])
+        row.pack(fill="x", pady=(px(6), 0))
+        self.link(row, "Ripristina predefinite", self.reset).pack(side="left")
+        self.label(row, "  ·  ", font=app.f_small, fg=c["soft"]).pack(side="left")
+        self.link(row, "Esci da Post-it", app.quit).pack(side="left")
+        self.label(row, "versione " + VERSION, font=app.f_small, fg=c["soft"]).pack(side="right")
         if self.br is not None:
             self.position()
 
@@ -568,7 +890,7 @@ class SettingsPanel(Popup):
         w, h = px(34), px(18)
         cv = tk.Canvas(parent, width=w, height=h, bg=self.c["bg"], highlightthickness=0,
                        cursor="hand2")
-        fill = self.c["ink"] if on else FAINT
+        fill = (MAC_GREEN if IS_MAC else self.c["ink"]) if on else FAINT
         cv.create_oval(0, 0, h, h, fill=fill, outline=fill)
         cv.create_oval(w - h, 0, w, h, fill=fill, outline=fill)
         cv.create_rectangle(h // 2, 0, w - h // 2, h, fill=fill, outline=fill)
@@ -589,7 +911,8 @@ class SettingsPanel(Popup):
     def toggle_autostart(self):
         on = not autostart_enabled()
         if set_autostart(on):
-            self.msg, self.msg_warn = ("Partirà all'accensione del PC" if on
+            self.msg, self.msg_warn = ("Partirà quando accendi %s" % (
+                                           "il Mac" if IS_MAC else "il PC") if on
                                        else "Non partirà più da solo"), False
         else:
             self.msg, self.msg_warn = "Impossibile cambiare l'avvio automatico", True
@@ -606,7 +929,9 @@ class SettingsPanel(Popup):
         if self.capturing is None:
             self.app.hotkeys.suspend()  # così la combinazione premuta arriva qui
         self.capturing = action
-        self.msg, self.msg_warn = "Premi Ctrl e/o Alt + un tasto  ·  Esc annulla", False
+        self.msg, self.msg_warn = ("Premi ⌃ o ⌘ (anche con ⌥ ⇧) + un tasto  ·  Esc annulla"
+                                   if IS_MAC else
+                                   "Premi Ctrl e/o Alt + un tasto  ·  Esc annulla"), False
         self.build()
 
     def stop_capture(self, msg="", warn=False):
@@ -621,16 +946,15 @@ class SettingsPanel(Popup):
             return None
         if e.keysym in MODIFIER_KEYSYMS:
             return "break"
-        mods = ((MOD_CONTROL if e.state & 0x4 else 0) | (MOD_ALT if e.state & 0x20000 else 0)
-                | (MOD_SHIFT if e.state & 0x1 else 0))
-        if e.keysym == "Escape" and not mods:
+        combo = event_combo(e)
+        if e.keysym == "Escape" and not combo[0]:
             self.stop_capture()
             return "break"
-        if not mods & CA:
-            self.msg, self.msg_warn = "Serve Ctrl e/o Alt insieme al tasto", True
+        if not combo_allowed(combo[0]) or combo[1] is None:
+            self.msg, self.msg_warn = ("Serve ⌃ o ⌘ insieme al tasto" if IS_MAC else
+                                       "Serve Ctrl e/o Alt insieme al tasto"), True
             self.build()
             return "break"
-        combo = [mods, e.keycode]
         for other, val in self.app.data["hotkeys"].items():
             if other != self.capturing and list(val) == combo:
                 self.msg, self.msg_warn = "Già usata per: " + ACTION_TEXT[other], True
@@ -786,10 +1110,11 @@ class RichNote:
         t.bind("<BackSpace>", self.on_backspace)
         t.bind("<Delete>", lambda _e: self.later_normalize(0, 1))
         t.bind("<Tab>", self.on_tab)
+        mod = "Command" if IS_MAC else "Control"
         for k in ("b", "B"):
-            t.bind("<Control-%s>" % k, lambda _e: self.toggle_inline("bold"))
+            t.bind("<%s-%s>" % (mod, k), lambda _e: self.toggle_inline("bold"))
         for k in ("i", "I"):
-            t.bind("<Control-%s>" % k, lambda _e: self.toggle_inline("italic"))
+            t.bind("<%s-%s>" % (mod, k), lambda _e: self.toggle_inline("italic"))
         t.bind("<<Paste>>", self.on_paste)
         for ev in ("<<Undo>>", "<<Redo>>", "<<Cut>>"):
             t.bind(ev, lambda _e: t.after_idle(self.normalize_all), add="+")
@@ -996,11 +1321,15 @@ class RichNote:
         t.see("insert")
 
     def on_key(self, e):
-        ctrl, alt = e.state & 0x4, e.state & 0x20000
-        if ctrl != 0 and alt == 0:
-            return None            # Ctrl+C, Ctrl+V, Ctrl+Z... comportamento normale
-        if alt and not ctrl:
-            return None
+        if IS_MAC:
+            if e.state & (0x8 | 0x4):  # ⌘C, ⌘V, ⌘Z e i tasti ⌃: comportamento normale
+                return None            # (⌥ invece scrive i caratteri speciali, es. ⌥5 = [)
+        else:
+            ctrl, alt = e.state & 0x4, e.state & 0x20000
+            if ctrl != 0 and alt == 0:
+                return None            # Ctrl+C, Ctrl+V, Ctrl+Z... comportamento normale
+            if alt and not ctrl:
+                return None
         if e.keysym == "space":
             return self.on_space()
         ch = e.char
@@ -1247,15 +1576,29 @@ class PostItApp:
 
         self.root = tk.Tk()
         self.root.title("Post-it")
-        if os.path.exists(ICON_FILE):
+        self.root.report_callback_exception = self.on_tk_error
+        if IS_WIN and os.path.exists(ICON_FILE):
             try:
                 self.root.iconbitmap(default=ICON_FILE)
             except tk.TclError:
                 pass
-        self.s = self.root.winfo_fpixels("1i") / 96.0
-        self.header_h = self.px(30)
+        if IS_MAC:   # punti di macOS: niente riscalatura; carattere di sistema (San Francisco)
+            self.s = 1.0
+            UI_FONT[:] = [tkfont.nametofont("TkDefaultFont").actual("family"), 2]
+            _SCREEN[:] = [0, 25, self.root.winfo_screenwidth(), self.root.winfo_screenheight()]
+        else:
+            self.s = self.root.winfo_fpixels("1i") / 96.0
+            if not IS_WIN:
+                _SCREEN[:] = [0, 0, self.root.winfo_screenwidth(), self.root.winfo_screenheight()]
+        self.header_h = self.px(34 if IS_MAC else 30)
         self.min_w, self.min_h = self.px(220), self.px(160)
-        self.root.overrideredirect(True)
+        if IS_MAC:
+            self.setup_mac()
+        else:
+            self.root.overrideredirect(True)
+        # ✕ della finestra, Alt+F4 o ⌘W nascondono soltanto: le scorciatoie restano attive
+        self.root.protocol("WM_DELETE_WINDOW", self.hide_window)
+        self.root.protocol("WM_SAVE_YOURSELF", self.save_now)   # spegnimento di Windows
         self.data["geometry"] = self.initial_geometry()
         self.root.geometry(self.data["geometry"])
         self.root.attributes("-topmost", self.data["topmost"])
@@ -1265,10 +1608,11 @@ class PostItApp:
         self.f_head = self.font(10, bold=True)
         self.f_small = self.font(9)
         self.f_small_b = self.font(9, bold=True)
-        self.f_icon = tkfont.Font(family="Segoe UI Symbol", size=11)
+        self.f_icon = tkfont.Font(family=UI_FONT[0] if IS_MAC else "Segoe UI Symbol",
+                                  size=11 + UI_FONT[1])
 
         self.container = None
-        self.edges = self.make_edges()
+        self.edges = self.make_edges() if IS_WIN else {}
         self.render()
 
         self.root.bind("<Key>", self.on_key)
@@ -1277,25 +1621,65 @@ class PostItApp:
             self.root.bind(ev, lambda _e: self.root.after_idle(self.update_hint), add="+")
 
         self.events = queue.Queue()
-        self.hotkeys = HotkeyThread(self.events, self.data["hotkeys"])
-        self.hotkeys.start()
+        self.hotkeys = make_hotkeys(self.events, self.data["hotkeys"])
         threading.Thread(target=listen_show_requests, args=(self.events,), daemon=True).start()
         self.root.after(40, self.poll_events)
-        self.root.after(10, self.show_in_taskbar)
+        if IS_WIN:
+            self.root.after(10, self.show_in_taskbar)
+
+    def setup_mac(self):
+        """Finestra macOS vera (angoli arrotondati, ombra, semafori) e menu dell'app."""
+        r = self.root
+        r.createcommand("::tk::mac::ReopenApplication", self.activate)  # clic sull'icona nel Dock
+        r.createcommand("::tk::mac::ShowPreferences", self.open_settings)   # ⌘,
+        r.createcommand("::tk::mac::Quit", self.quit)                       # ⌘Q
+        r.bind_all("<Command-w>", lambda _e: self.hide_window())
+        menubar = tk.Menu(r)
+        appmenu = tk.Menu(menubar, name="apple")
+        menubar.add_cascade(menu=appmenu)
+        appmenu.add_command(label="Informazioni su Post-it", command=lambda: messagebox.showinfo(
+            "Post-it", "Post-it %s\nTodo list e note sempre a portata di mano." % VERSION))
+        appmenu.add_separator()
+        notes = tk.Menu(menubar)
+        menubar.add_cascade(label="Post-it", menu=notes)
+        for i, key in enumerate(ORDER, start=1):
+            # ⌘1/2/3 li gestisce on_key; qui l'acceleratore serve solo da promemoria
+            notes.add_command(label="%s · %s" % (NOTES[key]["label"], NOTES[key]["name"]),
+                              accelerator="Command-%d" % i,
+                              command=lambda k=key: self.switch(k))
+        notes.add_separator()
+        notes.add_command(label="Sempre in primo piano", command=self.toggle_topmost)
+        notes.add_command(label="Riduci / espandi", command=self.cycle_size)
+        notes.add_command(label="Esporta…", command=lambda: self.toggle_popup(
+            ExportMenu, self.title_lbl))
+        menubar.add_cascade(label="Finestra", menu=tk.Menu(menubar, name="window"))
+        r.configure(menu=menubar)
+
+    def open_settings(self):
+        self.activate()
+        if not isinstance(self.popup, SettingsPanel):
+            SettingsPanel(self, self.title_lbl)
+
+    def on_tk_error(self, exc_type, exc, tb):
+        exc.__traceback__ = tb
+        log_error("interfaccia", exc)
 
     def run(self):
+        log("avvio %s (Python %s, %s)%s" % (VERSION, sys.version.split()[0], sys.platform,
+                                            " all'accensione" if "--autostart" in sys.argv else ""))
         self.root.mainloop()
 
     def px(self, n):
         return int(round(n * self.s))
 
     def font(self, size=11, bold=False, italic=False, over=False):
-        """Caratteri Segoe UI condivisi (creati una volta sola)."""
+        """Caratteri condivisi (creati una volta sola): Segoe UI su Windows,
+        San Francisco un po' più grande su Mac."""
         key = (size, bold, italic, over)
         f = self._fonts.get(key)
         if f is None:
             f = self._fonts[key] = tkfont.Font(
-                family="Segoe UI", size=size, weight="bold" if bold else "normal",
+                family=UI_FONT[0], size=size + UI_FONT[1], weight="bold" if bold else "normal",
                 slant="italic" if italic else "roman", overstrike=int(over))
         return f
 
@@ -1452,6 +1836,8 @@ class PostItApp:
         self.remember_geometry()
         self.hidden = True
         self.root.withdraw()
+        if IS_MAC:   # come ⌘H: il controllo torna subito all'app che stavi usando
+            mac_app(b"hide:", None, (ctypes.c_void_p,), None)
 
     def toggle_visible(self):
         if self.hidden:
@@ -1460,10 +1846,22 @@ class PostItApp:
             self.hide_window()
 
     def is_foreground(self):
+        if IS_MAC:
+            return bool(mac_app(b"isActive", ctypes.c_bool))
+        if not IS_WIN:
+            return self.root.focus_get() is not None
         return bool(self.hwnd) and user32.GetForegroundWindow() == self.hwnd
 
     def force_foreground(self):
-        """Windows non lascia rubare il primo piano: ci agganciamo al programma attivo."""
+        """Porta il Post-it davanti all'app che si sta usando."""
+        if IS_MAC:
+            self.root.lift()
+            mac_app(b"activateIgnoringOtherApps:", None, (ctypes.c_bool,), True)
+            return
+        if not IS_WIN:
+            self.root.lift()
+            return
+        # Windows non lascia rubare il primo piano: ci agganciamo al programma attivo
         hwnd = self.hwnd or user32.GetParent(self.root.winfo_id())
         fg_tid = user32.GetWindowThreadProcessId(user32.GetForegroundWindow(), None)
         my_tid = kernel32.GetCurrentThreadId()
@@ -1491,6 +1889,11 @@ class PostItApp:
         self.save_now()
         self.root.destroy()
 
+    def quit(self):
+        """Chiude davvero il programma (da «Esci da Post-it» o ⌘Q)."""
+        log("chiuso dall'utente")
+        self.close()
+
     def close_popup(self):
         if self.popup is not None:
             self.popup.close()
@@ -1507,18 +1910,23 @@ class PostItApp:
 
     # ------------------------------------------------------------ eventi e scorciatoie
     def poll_events(self):
-        try:
-            while True:
+        """Legge le scorciatoie arrivate. Si ripianifica sempre per prima cosa: un errore
+        in un'azione non deve mai spegnere le scorciatoie per il resto della giornata."""
+        self.root.after(40, self.poll_events)
+        while True:
+            try:
                 kind, value = self.events.get_nowait()
+            except queue.Empty:
+                return
+            try:
                 if kind == "hotkey":
                     self.on_hotkey(value)
                 elif kind == "status":
                     self.on_hotkey_status(value)
                 elif kind == "show":
                     self.activate()
-        except queue.Empty:
-            pass
-        self.root.after(40, self.poll_events)
+            except Exception as exc:  # noqa: BLE001
+                log_error("azione %s %s" % (kind, value), exc)
 
     def on_hotkey(self, action):
         if action == "write":
@@ -1582,7 +1990,7 @@ class PostItApp:
 
     def on_key(self, e):
         editing = isinstance(e.widget, (tk.Text, tk.Entry))
-        ctrl = bool(e.state & 0x4)
+        ctrl = bool(e.state & (0x8 if IS_MAC else 0x4))   # ⌘ su Mac, Ctrl altrove
         if e.keysym in ("1", "2", "3") and (ctrl or not editing):
             self.switch(ORDER[int(e.keysym) - 1])
             self.root.focus_force()
@@ -1774,6 +2182,19 @@ class PostItApp:
             for d in (p(5), p(9), p(13)):
                 cv.create_line(w - p(3), h - p(3) - d, w - p(3) - d, h - p(3),
                                width=max(1, p(1)), tags="line")
+        elif kind == "share":  # «condividi» di Apple: riquadro aperto con freccia in su
+            cv.create_line(p(7), p(7.5), p(5), p(7.5), p(5), p(16), w - p(5), p(16),
+                           w - p(5), p(7.5), w - p(7), p(7.5), **line)
+            cv.create_line(w / 2, p(2), w / 2, p(11), **line)
+            cv.create_line(w / 2 - p(3), p(5), w / 2, p(2), w / 2 + p(3), p(5), **line)
+        elif kind in ("pin", "pin_off"):  # puntina in stile SF Symbols
+            fill = "line" if kind == "pin" else ""
+            cv.create_oval(w / 2 - p(4.5), p(2), w / 2 + p(4.5), p(9), width=lw,
+                           tags=("frame", "dot") if fill else "frame")
+            cv.create_line(w / 2, p(9), w / 2, p(16), **line)
+        elif kind in ("up", "down"):  # freccia a V per riduci / espandi
+            a, b = (p(11), p(7)) if kind == "up" else (p(7), p(11))
+            cv.create_line(w / 2 - p(4.5), a, w / 2, b, w / 2 + p(4.5), a, **line)
         self.color_icon(cv, color)
         return cv
 
@@ -1782,6 +2203,7 @@ class PostItApp:
         cv.itemconfigure("line", fill=color)
         cv.itemconfigure("box", fill=color, outline=color)
         cv.itemconfigure("frame", outline=color)
+        cv.itemconfigure("dot", fill=color)
 
     def faint_button(self, parent, kind, cmd, tip):
         cv = self.drawn_icon(parent, kind, FAINT)
@@ -1798,16 +2220,22 @@ class PostItApp:
 
         tabs = tk.Frame(h, bg=c["head"])
         tabs.pack(side="left", padx=(self.px(8), self.px(4)))
-        size = self.px(16)
+        size = self.px(18 if IS_MAC else 16)
         for i, key in enumerate(ORDER, start=1):
             n = NOTES[key]
             page = self.data["page"][key]
-            dot = tk.Canvas(tabs, width=size, height=size, bg=n["bg"], cursor="hand2",
-                            highlightthickness=0)
-            dot.pack(side="left", padx=2)
             cur = key == self.data["current"]
-            dot.create_rectangle(1, 1, size - 1, size - 1, width=2,
-                                 outline=c["ink"] if cur else n["head"])
+            if IS_MAC:   # pallini come i tag colorati del Finder
+                dot = tk.Canvas(tabs, width=size, height=size, bg=c["head"], cursor="hand2",
+                                highlightthickness=0)
+                dot.create_oval(1, 1, size - 1, size - 1, fill=n["bg"], width=2 if cur else 1,
+                                outline=c["ink"] if cur else n["soft"])
+            else:
+                dot = tk.Canvas(tabs, width=size, height=size, bg=n["bg"], cursor="hand2",
+                                highlightthickness=0)
+                dot.create_rectangle(1, 1, size - 1, size - 1, width=2,
+                                     outline=c["ink"] if cur else n["head"])
+            dot.pack(side="left", padx=self.px(3 if IS_MAC else 2))
             if cur:  # quale dei due post-it di questo colore è aperto
                 dot.create_text(size / 2, size / 2 + 0.5, text=str(page + 1),
                                 fill=n["ink"], font=self.font(7, bold=True))
@@ -1821,15 +2249,28 @@ class PostItApp:
                          anchor="w", cursor="fleur")
         self.title_lbl = title
 
-        self.icon_button(h, "✕", self.close, "Chiudi", c["ink"]).pack(side="right",
-                                                                       padx=(0, self.px(4)))
         collapsed = self.mode == "collapsed"
-        self.icon_button(h, "▾" if collapsed else "▴", self.toggle_collapse,
-                         "Espandi" if collapsed else "Riduci", c["ink"]).pack(side="right")
         on = self.data["topmost"]
-        self.icon_button(h, "📌" if on else "📍", self.toggle_topmost,
-                         "Sempre in primo piano: " + ("ATTIVO" if on else "SPENTO"),
-                         c["ink"] if on else c["soft"]).pack(side="right")
+        pin_tip = "Sempre in primo piano: " + ("ATTIVO" if on else "SPENTO")
+        if IS_MAC:   # icone sottili in stile SF Symbols; per chiudere c'è il pallino rosso
+            for kind, cmd, tip, color in (
+                    ("down" if collapsed else "up", self.toggle_collapse,
+                     "Espandi" if collapsed else "Riduci", c["ink"]),
+                    ("pin" if on else "pin_off", self.toggle_topmost, pin_tip,
+                     c["ink"] if on else c["soft"])):
+                b = self.drawn_icon(h, kind, color)
+                b.bind("<Button-1>", lambda _e, f=cmd: f())
+                Tooltip(b, tip)
+                b.pack(side="right", padx=(0, self.px(6)))
+        else:
+            self.icon_button(h, "✕", self.hide_window,
+                             "Nascondi (riapri con %s)" % combo_label(
+                                 self.data["hotkeys"]["write"]),
+                             c["ink"]).pack(side="right", padx=(0, self.px(4)))
+            self.icon_button(h, "▾" if collapsed else "▴", self.toggle_collapse,
+                             "Espandi" if collapsed else "Riduci", c["ink"]).pack(side="right")
+            self.icon_button(h, "📌" if on else "📍", self.toggle_topmost, pin_tip,
+                             c["ink"] if on else c["soft"]).pack(side="right")
         # il titolo per ultimo: se un avviso è lungo si accorcia lui, non i pulsanti
         title.pack(side="left", fill="both", expand=True, padx=4)
 
@@ -1847,16 +2288,17 @@ class PostItApp:
                            font=self.f_small, cursor="hand2")
             clr.pack(side="left", padx=self.px(10), pady=2)
             clr.bind("<Button-1>", lambda _e: self.clear_done())
-        grip = self.drawn_icon(f, "grip", c["soft"], cursor="size_nw_se")
-        grip.pack(side="right", padx=(0, 1), pady=(0, 1))
-        grip.bind("<ButtonPress-1>", lambda e: self.start_resize(e, "se"))
-        grip.bind("<B1-Motion>", self.do_resize)
-        grip.bind("<ButtonRelease-1>", self.end_drag)
+        if IS_WIN:   # su Mac l'angolo per ridimensionare lo dà già la finestra
+            grip = self.drawn_icon(f, "grip", c["soft"], cursor="size_nw_se")
+            grip.pack(side="right", padx=(0, 1), pady=(0, 1))
+            grip.bind("<ButtonPress-1>", lambda e: self.start_resize(e, "se"))
+            grip.bind("<B1-Motion>", self.do_resize)
+            grip.bind("<ButtonRelease-1>", self.end_drag)
         keys = self.faint_button(f, "keys", lambda: self.toggle_popup(SettingsPanel, keys),
                                  "Scorciatoie e impostazioni")
-        keys.pack(side="right", padx=(0, self.px(2)))
-        exp = self.faint_button(f, "export", lambda: self.toggle_popup(ExportMenu, exp),
-                                "Esporta")
+        keys.pack(side="right", padx=(0, self.px(8 if IS_MAC else 2)))
+        exp = self.faint_button(f, "share" if IS_MAC else "export",
+                                lambda: self.toggle_popup(ExportMenu, exp), "Esporta")
         exp.pack(side="right", padx=(0, self.px(2)))
 
     # ----- note
@@ -1930,7 +2372,10 @@ class PostItApp:
 
         def on_wheel(ev):
             if canvas.winfo_exists() and self.list_frame.winfo_reqheight() > canvas.winfo_height():
-                canvas.yview_scroll(int(-ev.delta / 120), "units")
+                # Windows: multipli di 120 per scatto; Mac: piccoli passi del trackpad
+                step = -ev.delta if IS_MAC else int(-ev.delta / 120)
+                if step:
+                    canvas.yview_scroll(step, "units")
 
         self.list_frame.bind("<Configure>",
                              lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
@@ -1971,8 +2416,19 @@ class PostItApp:
             done = item["done"]
             fg = c["soft"] if done else c["ink"]
             row.configure(cursor="hand2")
-            box = tk.Label(row, text="☑" if done else "☐", bg=c["bg"], fg=fg,
-                           font=self.f_icon, cursor="hand2")
+            if IS_MAC:   # cerchio come in Promemoria: pieno con la spunta quando è fatto
+                s = self.px(18)
+                box = tk.Canvas(row, width=s + 2, height=s + 4, bg=c["bg"], highlightthickness=0,
+                                cursor="hand2")
+                if done:
+                    box.create_oval(1, 3, s, s + 2, fill=c["soft"], outline=c["soft"])
+                    box.create_line(s * .3, s * .55 + 2, s * .45, s * .72 + 2, s * .72, s * .36 + 2,
+                                    fill="white", width=2, capstyle="round", joinstyle="round")
+                else:
+                    box.create_oval(1, 3, s, s + 2, outline=c["soft"], width=1.5)
+            else:
+                box = tk.Label(row, text="☑" if done else "☐", bg=c["bg"], fg=fg,
+                               font=self.f_icon, cursor="hand2")
             box.pack(side="left", anchor="n")
             lbl = tk.Label(row, text=text, bg=c["bg"], fg=fg,
                            font=self.font(11, bold, italic, over=done), justify="left",
@@ -2000,19 +2456,40 @@ class PostItApp:
 
 
 def main():
-    try:
-        ctypes.windll.shcore.SetProcessDpiAwareness(1)  # testo nitido
-    except (AttributeError, OSError):
-        user32.SetProcessDPIAware()
-    try:
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_ID)
-    except (AttributeError, OSError):
+    sys.excepthook = lambda t, e, tb: log_error("programma", e.with_traceback(tb))
+    threading.excepthook = lambda a: log_error("thread %s" % a.thread, a.exc_value)
+    try:   # anche gli arresti gravi (rari) finiscono nel registro
+        import faulthandler
+        os.makedirs(APP_DIR, exist_ok=True)
+        faulthandler.enable(open(LOG_FILE + ".crash", "a"))
+    except (OSError, RuntimeError, AttributeError):
         pass
+    if IS_WIN:
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)  # testo nitido
+        except (AttributeError, OSError):
+            user32.SetProcessDPIAware()
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_ID)
+        except (AttributeError, OSError):
+            pass
     if signal_existing_instance():
-        return  # già aperto: l'istanza esistente si mostra
+        log("già aperto: chiedo all'altra copia di mostrarsi")
+        return
     if autostart_enabled():
         set_autostart(True)  # aggiorna il percorso se il programma è stato spostato
-    PostItApp().run()
+    # all'accensione il desktop può non essere ancora pronto: se l'avvio fallisce si
+    # riprova qualche volta invece di sparire in silenzio
+    attempts = 4 if "--autostart" in sys.argv else 1
+    for attempt in range(1, attempts + 1):
+        try:
+            PostItApp().run()
+            log("uscita normale")
+            return
+        except Exception as exc:  # noqa: BLE001
+            log_error("avvio, tentativo %d di %d" % (attempt, attempts), exc)
+            if attempt < attempts:
+                time.sleep(5 * attempt)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,64 @@
+# Crea Post-it.app per Mac (Apple Silicon e Intel) su un Mac di GitHub, la prova
+# e fa gli screenshot. Quando si pubblica una release, aggiunge il .dmg alla release.
+name: Mac
+
+on:
+  push:
+    branches: [mac-prova]
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  mac:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Python 3.12 universale (python.org, con Tk)
+        run: |
+          curl -sSLo python.pkg https://www.python.org/ftp/python/3.12.10/python-3.12.10-macos11.pkg
+          sudo installer -pkg python.pkg -target /
+          echo "/Library/Frameworks/Python.framework/Versions/3.12/bin" >> "$GITHUB_PATH"
+
+      - name: Strumenti
+        run: python3 -m pip install --quiet pyinstaller pillow
+
+      - name: Prova il programma e fa gli screenshot
+        run: python3 tests/mac_check.py PostIt.pyw screenshot
+
+      - name: Crea Post-it.app
+        run: |
+          python3 -m PyInstaller --noconfirm --windowed --name "Post-it" \
+            --icon postit.ico --add-data "postit.ico:." \
+            --osx-bundle-identifier it.postit.note --target-arch universal2 PostIt.pyw
+          mkdir dmg && cp -R "dist/Post-it.app" dmg/ && ln -s /Applications dmg/Applications
+          hdiutil create -volname "Post-it" -srcfolder dmg -ov -format UDZO Post-it-Mac.dmg
+          lipo -archs "dist/Post-it.app/Contents/MacOS/Post-it"
+
+      - name: Prova l'app creata
+        run: |
+          open "dist/Post-it.app"
+          sleep 10
+          pgrep -fl "Post-it.app" || (echo "L'app non è rimasta aperta"; exit 1)
+          screencapture -x screenshot/7-app-schermo-intero.png
+          cat "$HOME/Library/Application Support/PostIt/postit.log" || true
+          osascript -e 'quit app "Post-it"' || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: post-it-mac
+          path: |
+            screenshot
+            Post-it-Mac.dmg
+
+      - name: Aggiunge il .dmg alla release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.event.release.tag_name }}" Post-it-Mac.dmg --clobber
