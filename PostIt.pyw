@@ -42,7 +42,7 @@ import tkinter as tk
 import traceback
 from tkinter import font as tkfont, messagebox
 
-VERSION = "1.3"
+VERSION = "1.3.1"
 IS_WIN = sys.platform == "win32"
 IS_MAC = sys.platform == "darwin"
 
@@ -78,6 +78,84 @@ def log_error(where, exc=None):
     exc = exc or sys.exc_info()[1]
     log("ERRORE in %s:\n%s" % (where, "".join(
         traceback.format_exception(type(exc), exc, exc.__traceback__)).rstrip()))
+
+
+# Segno di vita: mentre il programma è aperto, postit.vivo contiene l'ora dell'ultimo
+# minuto. Un'uscita regolare lo cancella; se all'avvio c'è ancora, la volta prima il
+# programma è stato chiuso da fuori (Gestione attività, un altro programma...) o si è
+# fermato di colpo, e il registro dice fino a quando era vivo.
+ALIVE_FILE = os.path.join(APP_DIR, "postit.vivo")
+
+
+def mark_alive(state="aperto"):
+    try:
+        os.makedirs(APP_DIR, exist_ok=True)
+        with open(ALIVE_FILE, "w", encoding="utf-8") as f:
+            f.write("%s %s" % (time.strftime("%Y-%m-%d %H:%M:%S"), state))
+    except OSError:
+        pass
+
+
+def clear_alive():
+    try:
+        os.remove(ALIVE_FILE)
+    except OSError:
+        pass
+
+
+def check_last_exit():
+    """Annota nel registro se la volta precedente il programma non è uscito da solo."""
+    try:
+        with open(ALIVE_FILE, encoding="utf-8") as f:
+            when, _, state = f.read().strip().rpartition(" ")
+    except OSError:
+        return
+    if state == "spegnimento":
+        log("la volta precedente si è chiuso con lo spegnimento o la disconnessione (%s)" % when)
+    else:
+        log("ATTENZIONE: la volta precedente il Post-it è stato chiuso senza uscire da solo "
+            "(da un altro programma, da Gestione attività o per un arresto improvviso). "
+            "Ultimo segno di vita: %s (%s)" % (when, state))
+
+
+_power_watch = []   # tiene in vita la funzione che Windows richiama
+
+
+def watch_power():
+    """Annota quando il PC va in sospensione e quando si riattiva (solo Windows)."""
+    if not IS_WIN:
+        return
+    from ctypes import wintypes
+    callback_type = ctypes.WINFUNCTYPE(wintypes.ULONG, ctypes.c_void_p, wintypes.ULONG,
+                                       ctypes.c_void_p)
+
+    class Params(ctypes.Structure):
+        _fields_ = [("Callback", callback_type), ("Context", ctypes.c_void_p)]
+
+    def on_power(_context, kind, _setting):
+        try:
+            if kind == 4:      # PBT_APMSUSPEND
+                log("il PC va in sospensione")
+                mark_alive("sospensione")
+            elif kind == 18:   # PBT_APMRESUMEAUTOMATIC
+                log("il PC si riattiva")
+                mark_alive()
+        except Exception:  # noqa: BLE001  (mai bloccare la sospensione di Windows)
+            pass
+        return 0
+
+    try:
+        register = ctypes.windll.powrprof.PowerRegisterSuspendResumeNotification
+        register.argtypes = [wintypes.DWORD, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+        register.restype = wintypes.DWORD
+        params, handle = Params(callback_type(on_power), None), ctypes.c_void_p()
+        err = register(2, ctypes.byref(params), ctypes.byref(handle))  # DEVICE_NOTIFY_CALLBACK
+        if err:
+            log("avviso: sospensione e ripresa non verranno annotate (errore %d)" % err)
+        else:
+            _power_watch.extend([params, handle])
+    except (AttributeError, OSError) as exc:
+        log("avviso: sospensione e ripresa non verranno annotate (%s)" % exc)
 
 
 # ---------------------------------------------------------------- post-it
@@ -1613,7 +1691,7 @@ class PostItApp:
             self.root.overrideredirect(True)
         # ✕ della finestra, Alt+F4 o ⌘W nascondono soltanto: le scorciatoie restano attive
         self.root.protocol("WM_DELETE_WINDOW", self.hide_window)
-        self.root.protocol("WM_SAVE_YOURSELF", self.save_now)   # spegnimento di Windows
+        self.root.protocol("WM_SAVE_YOURSELF", self.on_session_end)   # spegnimento di Windows
         self.data["geometry"] = self.initial_geometry()
         self.root.geometry(self.data["geometry"])
         self.root.attributes("-topmost", self.data["topmost"])
@@ -1639,6 +1717,7 @@ class PostItApp:
         self.hotkeys = make_hotkeys(self.events, self.data["hotkeys"])
         threading.Thread(target=listen_show_requests, args=(self.events,), daemon=True).start()
         self.root.after(40, self.poll_events)
+        self.alive_tick()
         if IS_WIN:
             self.root.after(10, self.show_in_taskbar)
 
@@ -1674,6 +1753,17 @@ class PostItApp:
         self.activate()
         if not isinstance(self.popup, SettingsPanel):
             SettingsPanel(self, self.title_lbl)
+
+    def alive_tick(self):
+        """Ogni minuto aggiorna il segno di vita (vedi ALIVE_FILE)."""
+        self.root.after(60_000, self.alive_tick)
+        mark_alive()
+
+    def on_session_end(self):
+        """Windows si spegne, si riavvia o chiude la sessione: salva e lo annota."""
+        log("Windows si spegne o chiude la sessione: salvo")
+        self.save_now()
+        mark_alive("spegnimento")
 
     def on_tk_error(self, exc_type, exc, tb):
         exc.__traceback__ = tb
@@ -2493,18 +2583,23 @@ def main():
         return
     if autostart_enabled():
         set_autostart(True)  # aggiorna il percorso se il programma è stato spostato
+    check_last_exit()
+    watch_power()
     # all'accensione il desktop può non essere ancora pronto: se l'avvio fallisce si
     # riprova qualche volta invece di sparire in silenzio
     attempts = 4 if "--autostart" in sys.argv else 1
-    for attempt in range(1, attempts + 1):
-        try:
-            PostItApp().run()
-            log("uscita normale")
-            return
-        except Exception as exc:  # noqa: BLE001
-            log_error("avvio, tentativo %d di %d" % (attempt, attempts), exc)
-            if attempt < attempts:
-                time.sleep(5 * attempt)
+    try:
+        for attempt in range(1, attempts + 1):
+            try:
+                PostItApp().run()
+                log("uscita normale")
+                return
+            except Exception as exc:  # noqa: BLE001
+                log_error("avvio, tentativo %d di %d" % (attempt, attempts), exc)
+                if attempt < attempts:
+                    time.sleep(5 * attempt)
+    finally:
+        clear_alive()   # uscita regolare (o avvio fallito, già annotato)
 
 
 if __name__ == "__main__":

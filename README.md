@@ -71,7 +71,7 @@ Funzionano anche mentre usi altri programmi. Si cambiano dal simbolo della tasti
 
 Nelle liste di attività `# Lavoro` crea un titolo di sezione. La freccia in basso a destra esporta il post-it aperto, o tutti, in un file di testo (in `Documenti\Post-it`).
 
-I dati restano sul tuo computer: `%APPDATA%\PostIt\postit.json` su Windows, `~/Library/Application Support/PostIt/postit.json` sul Mac. Nella stessa cartella `postit.log` annota avvii ed eventuali errori: se qualcosa non va, è il primo file da guardare.
+I dati restano sul tuo computer: `%APPDATA%\PostIt\postit.json` su Windows, `~/Library/Application Support/PostIt/postit.json` sul Mac. Nella stessa cartella `postit.log` annota avvii, eventuali errori, sospensioni e spegnimenti del PC, e segnala se il Post-it era stato chiuso da un altro programma: se qualcosa non va, è il primo file da guardare.
 
 ## Modificarlo
 
